@@ -18,6 +18,7 @@ import de.robv.android.xposed.XSharedPreferences
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.ref.WeakReference
 import java.util.Collections
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -31,6 +32,8 @@ class MainHook : IXposedHookLoadPackage {
         const val ACTION_REGISTER = "com.example.pinguard.REGISTER_APP"
         const val ACTION_PING = "com.example.pinguard.PING"
         const val ACTION_PONG = "com.example.pinguard.PONG"
+        const val EXTRA_TOKEN = "t"
+        const val EXTRA_PKG = "pkg"
     }
 
     // ── state ───────────────────────────────────────────────────────
@@ -45,16 +48,22 @@ class MainHook : IXposedHookLoadPackage {
         Collections.synchronizedSet(HashSet())
     private var debugLog = false
 
-    // ── prefs ───────────────────────────────────────────────────────
+    /** One-time token generated per auth session to prevent broadcast spoofing */
+    @Volatile private var authToken: String? = null
+    /** Secret shared between system_server and hooked apps at hook load time */
+    private val sessionSecret = UUID.randomUUID().toString()
+
+    // ── logging ─────────────────────────────────────────────────────
 
     private fun log(msg: String) {
         if (debugLog) XposedBridge.log("$TAG: $msg")
     }
 
-    /** Always log regardless of debug toggle — for critical events only */
     private fun logAlways(msg: String) {
         XposedBridge.log("$TAG: $msg")
     }
+
+    // ── prefs ───────────────────────────────────────────────────────
 
     private fun loadPrefs(): XSharedPreferences? {
         return try {
@@ -65,13 +74,11 @@ class MainHook : IXposedHookLoadPackage {
         } catch (_: Exception) { null }
     }
 
-    private fun isEnabled(): Boolean {
-        return loadPrefs()?.getBoolean("enabled", true) ?: true
-    }
+    private fun isEnabled(): Boolean =
+        loadPrefs()?.getBoolean("enabled", true) ?: true
 
-    private fun isHideExitToast(): Boolean {
-        return loadPrefs()?.getBoolean("hide_exit_toast", false) ?: false
-    }
+    private fun isHideExitToast(): Boolean =
+        loadPrefs()?.getBoolean("hide_exit_toast", false) ?: false
 
     // ── entry ───────────────────────────────────────────────────────
 
@@ -84,20 +91,21 @@ class MainHook : IXposedHookLoadPackage {
         }
     }
 
-    // ── system_server hooks ─────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════
+    //  system_server hooks
+    // ═══════════════════════════════════════════════════════════════
 
     private fun hookSystemServer(lpparam: XC_LoadPackage.LoadPackageParam) {
-        logAlways("=== system_server init ===")
+        logAlways("=== init ===")
 
         val atmsClass = try {
             XposedHelpers.findClass(
-                "com.android.server.wm.ActivityTaskManagerService", lpparam.classLoader
-            )
+                "com.android.server.wm.ActivityTaskManagerService", lpparam.classLoader)
         } catch (e: Exception) {
             logAlways("ATMS not found: ${e.message}"); return
         }
 
-        // 1. onSystemReady → register broadcast receivers
+        // 1. onSystemReady
         try {
             XposedHelpers.findAndHookMethod(atmsClass, "onSystemReady",
                 object : XC_MethodHook() {
@@ -107,27 +115,21 @@ class MainHook : IXposedHookLoadPackage {
                         val ctx = XposedHelpers.getObjectField(
                             param.thisObject, "mContext") as Context
                         registerReceivers(ctx)
-                        logAlways("onSystemReady: receivers registered")
+                        logAlways("ready (secret=${sessionSecret.take(8)}...)")
                     }
                 })
         } catch (e: Exception) {
-            logAlways("onSystemReady hook fail: ${e.message}")
+            logAlways("onSystemReady fail: ${e.message}")
         }
 
-        // 2. Hook unpin methods
+        // 2. Unpin interception
         val unpinHook = object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 log(">>> ${param.method.name}")
 
-                if (!isEnabled()) { log("disabled, pass"); return }
-
-                if (authPassed.compareAndSet(true, false)) {
-                    log("auth OK, pass"); return
-                }
-
-                if (!isPinnedAppProtected(param.thisObject)) {
-                    log("not protected, pass"); return
-                }
+                if (!isEnabled()) { log("disabled"); return }
+                if (authPassed.compareAndSet(true, false)) { log("auth OK"); return }
+                if (!isPinnedAppProtected(param.thisObject)) { log("not protected"); return }
 
                 hookedMethodName = param.method.name
                 if (atmsRef == null) atmsRef = param.thisObject
@@ -136,19 +138,22 @@ class MainHook : IXposedHookLoadPackage {
                     XposedHelpers.getObjectField(param.thisObject, "mContext") as Context
                 } catch (_: Exception) { return }
 
-                val token = Binder.clearCallingIdentity()
+                // Generate one-time auth token
+                val token = UUID.randomUUID().toString()
+                authToken = token
+
+                val callingId = Binder.clearCallingIdentity()
                 try {
-                    ctx.sendBroadcast(Intent(ACTION_SHOW_AUTH))
-                    // Set toast suppression window only if pref is ON
+                    ctx.sendBroadcast(Intent(ACTION_SHOW_AUTH).putExtra(EXTRA_TOKEN, token))
                     if (isHideExitToast()) {
                         suppressToastUntil.set(System.currentTimeMillis() + 3000)
                     }
-                    log("SHOW_AUTH sent, blocked")
+                    log("blocked, token=${token.take(8)}")
                     param.setResult(null)
                 } catch (e: Exception) {
                     log("broadcast fail: ${e.message}")
                 } finally {
-                    Binder.restoreCallingIdentity(token)
+                    Binder.restoreCallingIdentity(callingId)
                 }
             }
         }
@@ -157,23 +162,20 @@ class MainHook : IXposedHookLoadPackage {
             try {
                 XposedHelpers.findAndHookMethod(atmsClass, m, unpinHook)
                 logAlways("hooked $m ✓")
-            } catch (_: NoSuchMethodError) {
-                log("$m not found")
-            } catch (e: Exception) {
+            } catch (_: NoSuchMethodError) {} catch (e: Exception) {
                 log("$m fail: ${e.message}")
             }
         }
 
-        // 3. Toast suppression — time-window based, only when hide_exit_toast ON
+        // 3. Toast suppression (time-window + one-shot)
         try {
             XposedHelpers.findAndHookMethod("android.widget.Toast", lpparam.classLoader,
                 "show", object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val deadline = suppressToastUntil.get()
                         if (deadline == 0L || System.currentTimeMillis() > deadline) return
-                        // Within window — suppress this toast
-                        suppressToastUntil.set(0) // one-shot: only suppress one toast
-                        log("suppressed exit toast")
+                        suppressToastUntil.set(0)
+                        log("suppressed toast")
                         param.setResult(null)
                     }
                 })
@@ -189,13 +191,12 @@ class MainHook : IXposedHookLoadPackage {
             val ltc = XposedHelpers.getObjectField(atms, "mLockTaskController")
             val tasks = XposedHelpers.getObjectField(ltc, "mLockTaskModeTasks") as? ArrayList<Any>
             if (tasks.isNullOrEmpty()) return false
-            val top = tasks.last()
-            val pkg = getTaskPackage(top)
-            log("pinned=$pkg protected=$protectedPackages")
+            val pkg = getTaskPackage(tasks.last())
+            log("pinned=$pkg scope=$protectedPackages")
             pkg != null && pkg in protectedPackages
         } catch (e: Exception) {
-            log("isPinnedAppProtected err: ${e.message}")
-            false // fail-open: don't block if we can't determine
+            log("check err: ${e.message}")
+            false
         }
     }
 
@@ -209,60 +210,74 @@ class MainHook : IXposedHookLoadPackage {
         }
     }
 
-    // ── broadcast receivers (system_server side) ────────────────────
+    // ── broadcast receivers (system_server) ─────────────────────────
 
     private fun registerReceivers(ctx: Context) {
-        val h = handler!!
+        val h = handler ?: return
 
-        // PING/PONG for module status check
+        // PING/PONG — include secret so only our module responds
         ctx.registerReceiver(object : BroadcastReceiver() {
             override fun onReceive(c: Context, i: Intent) {
+                if (i.getStringExtra(EXTRA_TOKEN) != sessionSecret) return
                 c.sendBroadcast(Intent(ACTION_PONG))
             }
         }, IntentFilter(ACTION_PING), null, h, Context.RECEIVER_EXPORTED)
 
-        // App registration
+        // App registration — validate secret
         ctx.registerReceiver(object : BroadcastReceiver() {
             override fun onReceive(c: Context, intent: Intent) {
-                val pkg = intent.getStringExtra("pkg") ?: return
-                if (protectedPackages.add(pkg)) {
-                    log("protected +$pkg (${protectedPackages.size})")
-                }
+                if (intent.getStringExtra(EXTRA_TOKEN) != sessionSecret) return
+                val pkg = intent.getStringExtra(EXTRA_PKG) ?: return
+                if (protectedPackages.add(pkg)) log("protected +$pkg")
             }
         }, IntentFilter(ACTION_REGISTER), null, h, Context.RECEIVER_EXPORTED)
 
-        // Auth success → manual unpin
+        // Auth success — validate one-time token
         ctx.registerReceiver(object : BroadcastReceiver() {
             override fun onReceive(c: Context, intent: Intent) {
-                log("AUTH_SUCCESS → manualUnpin")
+                val t = intent.getStringExtra(EXTRA_TOKEN)
+                val expected = authToken
+                if (t == null || expected == null || t != expected) {
+                    logAlways("AUTH_SUCCESS rejected: bad token")
+                    return
+                }
+                authToken = null // consume token
+                log("AUTH_SUCCESS verified")
                 h.post { manualUnpin() }
             }
         }, IntentFilter(ACTION_AUTH_SUCCESS), null, h, Context.RECEIVER_EXPORTED)
     }
 
-    // ── target app hooks ────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════
+    //  target app hooks
+    // ═══════════════════════════════════════════════════════════════
+
+    /** Session secret injected by Xposed — shared in-memory, not broadcast */
+    private var appSecret: String? = null
 
     private fun hookTargetApp(lpparam: XC_LoadPackage.LoadPackageParam) {
-        log("hookTargetApp ${lpparam.packageName}")
+        log("hookTarget ${lpparam.packageName}")
 
-        // onResume: register package + SHOW_AUTH receiver
         XposedHelpers.findAndHookMethod("android.app.Activity", lpparam.classLoader,
             "onResume", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val activity = param.thisObject as Activity
                     currentActivity = WeakReference(activity)
 
-                    // Always register actual package name
+                    // Register package with secret
                     activity.sendBroadcast(
-                        Intent(ACTION_REGISTER).putExtra("pkg", activity.packageName)
+                        Intent(ACTION_REGISTER)
+                            .putExtra(EXTRA_PKG, activity.packageName)
+                            .putExtra(EXTRA_TOKEN, sessionSecret)
                     )
 
-                    // Only register SHOW_AUTH receiver once per instance
                     if (XposedHelpers.getAdditionalInstanceField(activity, "pg") != null) return
                     XposedHelpers.setAdditionalInstanceField(activity, "pg", true)
 
                     val receiver = object : BroadcastReceiver() {
                         override fun onReceive(ctx: Context, intent: Intent) {
+                            // Save the auth token from system_server
+                            appSecret = intent.getStringExtra(EXTRA_TOKEN)
                             val act = currentActivity?.get() ?: return
                             log("SHOW_AUTH → ${act.javaClass.name}")
                             showAuth(act)
@@ -270,12 +285,10 @@ class MainHook : IXposedHookLoadPackage {
                     }
                     XposedHelpers.setAdditionalInstanceField(activity, "pg_r", receiver)
                     activity.registerReceiver(
-                        receiver, IntentFilter(ACTION_SHOW_AUTH), Context.RECEIVER_EXPORTED
-                    )
+                        receiver, IntentFilter(ACTION_SHOW_AUTH), Context.RECEIVER_EXPORTED)
                 }
             })
 
-        // onActivityResult: credential verification result
         XposedHelpers.findAndHookMethod("android.app.Activity", lpparam.classLoader,
             "onActivityResult",
             Int::class.javaPrimitiveType, Int::class.javaPrimitiveType, Intent::class.java,
@@ -283,7 +296,6 @@ class MainHook : IXposedHookLoadPackage {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     if (param.args[0] as Int != REQ) return
                     val activity = param.thisObject as Activity
-                    // Deduplicate (base class + subclass both fire)
                     val tag = "pg_handled"
                     if (XposedHelpers.getAdditionalInstanceField(activity, tag) != null) {
                         XposedHelpers.removeAdditionalInstanceField(activity, tag)
@@ -291,36 +303,42 @@ class MainHook : IXposedHookLoadPackage {
                     }
                     XposedHelpers.setAdditionalInstanceField(activity, tag, true)
                     if (param.args[1] as Int == Activity.RESULT_OK) {
-                        activity.sendBroadcast(Intent(ACTION_AUTH_SUCCESS))
-                        log("AUTH_SUCCESS from ${activity.packageName}")
+                        // Send AUTH_SUCCESS with the token from system_server
+                        activity.sendBroadcast(
+                            Intent(ACTION_AUTH_SUCCESS).putExtra(EXTRA_TOKEN, appSecret)
+                        )
+                        appSecret = null
+                        log("AUTH_SUCCESS (verified)")
                     }
                 }
             })
 
-        // onDestroy: cleanup receiver
         XposedHelpers.findAndHookMethod("android.app.Activity", lpparam.classLoader,
             "onDestroy", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val r = XposedHelpers.getAdditionalInstanceField(
                         param.thisObject, "pg_r") as? BroadcastReceiver ?: return
-                    try { (param.thisObject as Activity).unregisterReceiver(r) } catch (_: Exception) {}
+                    try { (param.thisObject as Activity).unregisterReceiver(r) }
+                    catch (_: Exception) {}
                 }
             })
     }
 
-    // ── manual unpin (bypass keyguard) ──────────────────────────────
+    // ═══════════════════════════════════════════════════════════════
+    //  manual unpin (bypass keyguard)
+    // ═══════════════════════════════════════════════════════════════
 
     @Suppress("UNCHECKED_CAST")
     private fun manualUnpin() {
-        val token = Binder.clearCallingIdentity()
+        val callingId = Binder.clearCallingIdentity()
         try {
             val globalLock = XposedHelpers.getObjectField(atmsRef, "mGlobalLock")
             synchronized(globalLock) {
                 val ltc = XposedHelpers.getObjectField(atmsRef, "mLockTaskController")
 
-                // 1. Clear locked tasks
                 try {
-                    val tasks = XposedHelpers.getObjectField(ltc, "mLockTaskModeTasks") as ArrayList<Any>
+                    val tasks = XposedHelpers.getObjectField(
+                        ltc, "mLockTaskModeTasks") as ArrayList<Any>
                     for (i in tasks.indices.reversed()) {
                         try { XposedHelpers.callMethod(ltc, "clearLockedTask", tasks[i]) }
                         catch (_: Exception) {}
@@ -328,36 +346,38 @@ class MainHook : IXposedHookLoadPackage {
                     tasks.clear()
                 } catch (e: Exception) { log("clearTasks: ${e.message}") }
 
-                // 2. Set mode NONE
                 try { XposedHelpers.setIntField(ltc, "mLockTaskModeState", 0) }
                 catch (_: Exception) {}
 
-                // 3. Update status bar (explicit int to avoid autoboxing crash)
                 try {
                     val sb = XposedHelpers.callMethod(ltc, "getStatusBarService")
-                    sb.javaClass.getMethod("setLockTaskModeState", Int::class.javaPrimitiveType)
-                        .invoke(sb, 0)
+                    sb.javaClass.getMethod(
+                        "setLockTaskModeState", Int::class.javaPrimitiveType
+                    ).invoke(sb, 0)
                 } catch (_: Exception) {}
             }
-            log("manualUnpin OK")
+            log("unpin OK")
         } catch (e: Exception) {
-            logAlways("manualUnpin FAIL: ${e.message}")
-            // Fallback: normal unpin (will show keyguard but won't crash)
+            logAlways("unpin FAIL: ${e.message}")
             authPassed.set(true)
-            try { XposedHelpers.callMethod(atmsRef, hookedMethodName ?: "stopSystemLockTaskMode") }
+            try { XposedHelpers.callMethod(
+                atmsRef, hookedMethodName ?: "stopSystemLockTaskMode") }
             catch (_: Exception) {}
         } finally {
-            Binder.restoreCallingIdentity(token)
+            Binder.restoreCallingIdentity(callingId)
         }
     }
 
-    // ── show credential dialog ──────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════
+    //  credential dialog
+    // ═══════════════════════════════════════════════════════════════
 
     private fun showAuth(activity: Activity) {
         val km = activity.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
         if (!km.isKeyguardSecure) {
-            log("no secure lock, auto-pass")
-            activity.sendBroadcast(Intent(ACTION_AUTH_SUCCESS))
+            activity.sendBroadcast(
+                Intent(ACTION_AUTH_SUCCESS).putExtra(EXTRA_TOKEN, appSecret))
+            appSecret = null
             return
         }
         @Suppress("DEPRECATION")
@@ -365,10 +385,10 @@ class MainHook : IXposedHookLoadPackage {
         if (intent != null) {
             @Suppress("DEPRECATION")
             activity.startActivityForResult(intent, REQ)
-            log("credential launched")
         } else {
-            log("createConfirmDeviceCredentialIntent null, auto-pass")
-            activity.sendBroadcast(Intent(ACTION_AUTH_SUCCESS))
+            activity.sendBroadcast(
+                Intent(ACTION_AUTH_SUCCESS).putExtra(EXTRA_TOKEN, appSecret))
+            appSecret = null
         }
     }
 }
