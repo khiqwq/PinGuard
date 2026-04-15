@@ -1,4 +1,4 @@
-package com.example.pinguard
+package app.github.pinguard
 
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -72,10 +72,10 @@ class MainActivity : ComponentActivity() {
         }
         registerReceiver(
             pongReceiver,
-            IntentFilter("com.example.pinguard.PONG"),
+            IntentFilter("app.github.pinguard.PONG"),
             Context.RECEIVER_EXPORTED
         )
-        sendBroadcast(Intent("com.example.pinguard.PING").putExtra("pkg", packageName))
+        sendBroadcast(Intent("app.github.pinguard.PING").putExtra("pkg", packageName))
 
         setContent {
             MaterialTheme(colorScheme = lightColorScheme()) {

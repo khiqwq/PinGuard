@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.pinguard"
+    namespace = "app.github.pinguard"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.example.pinguard"
+        applicationId = "app.github.pinguard"
         minSdk = 35
         targetSdk = 36
         versionCode = 1
