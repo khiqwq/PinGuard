@@ -34,21 +34,22 @@ class MainHook : IXposedHookLoadPackage {
         const val ACTION_PONG = "com.example.pinguard.PONG"
         const val EXTRA_TOKEN = "t"
         const val EXTRA_PKG = "pkg"
+        const val MAX_PROTECTED = 100
     }
 
     // ── state ───────────────────────────────────────────────────────
 
     private val authPassed = AtomicBoolean(false)
+    private val authPending = AtomicBoolean(false) // prevents token overwrite race
     private val suppressToastUntil = AtomicLong(0)
-    private var atmsRef: Any? = null
-    private var hookedMethodName: String? = null
-    private var handler: Handler? = null
+    @Volatile private var atmsRef: Any? = null
+    @Volatile private var hookedMethodName: String? = null
+    @Volatile private var handler: Handler? = null
     private var currentActivity: WeakReference<Activity>? = null
     private val protectedPackages: MutableSet<String> =
         Collections.synchronizedSet(HashSet())
     private var debugLog = false
 
-    /** One-time token generated per auth session to prevent broadcast spoofing */
     @Volatile private var authToken: String? = null
 
     // ── logging ─────────────────────────────────────────────────────
@@ -127,6 +128,14 @@ class MainHook : IXposedHookLoadPackage {
 
                 if (!isEnabled()) { log("disabled"); return }
                 if (authPassed.compareAndSet(true, false)) { log("auth OK"); return }
+
+                // If auth is already pending, just block (don't overwrite token)
+                if (authPending.get()) {
+                    log("auth pending, block")
+                    param.setResult(null)
+                    return
+                }
+
                 val pinnedPkg = getPinnedAppPackage(param.thisObject)
                 if (pinnedPkg == null || pinnedPkg !in protectedPackages) {
                     log("not protected ($pinnedPkg)"); return
@@ -139,13 +148,13 @@ class MainHook : IXposedHookLoadPackage {
                     XposedHelpers.getObjectField(param.thisObject, "mContext") as Context
                 } catch (_: Exception) { return }
 
-                // Generate one-time auth token
+                // Generate one-time auth token + set pending flag
                 val token = UUID.randomUUID().toString()
                 authToken = token
+                authPending.set(true)
 
                 val callingId = Binder.clearCallingIdentity()
                 try {
-                    // Targeted broadcast — only the pinned app receives the token
                     ctx.sendBroadcast(
                         Intent(ACTION_SHOW_AUTH)
                             .setPackage(pinnedPkg)
@@ -157,6 +166,7 @@ class MainHook : IXposedHookLoadPackage {
                     log("blocked, token=${token.take(8)}")
                     param.setResult(null)
                 } catch (e: Exception) {
+                    authPending.set(false)
                     log("broadcast fail: ${e.message}")
                 } finally {
                     Binder.restoreCallingIdentity(callingId)
@@ -214,16 +224,20 @@ class MainHook : IXposedHookLoadPackage {
     private fun registerReceivers(ctx: Context) {
         val h = handler ?: return
 
-        // PING/PONG for module status check
+        // PING/PONG — respond with targeted PONG
         ctx.registerReceiver(object : BroadcastReceiver() {
             override fun onReceive(c: Context, i: Intent) {
-                c.sendBroadcast(Intent(ACTION_PONG))
+                val sender = i.getStringExtra(EXTRA_PKG)
+                val pong = Intent(ACTION_PONG)
+                if (sender != null) pong.setPackage(sender)
+                c.sendBroadcast(pong)
             }
         }, IntentFilter(ACTION_PING), null, h, Context.RECEIVER_EXPORTED)
 
-        // App registration (low-risk: worst case adds app to protected list)
+        // App registration — capped to prevent DoS
         ctx.registerReceiver(object : BroadcastReceiver() {
             override fun onReceive(c: Context, intent: Intent) {
+                if (protectedPackages.size >= MAX_PROTECTED) return
                 val pkg = intent.getStringExtra(EXTRA_PKG) ?: return
                 if (protectedPackages.add(pkg)) log("protected +$pkg")
             }
@@ -235,21 +249,34 @@ class MainHook : IXposedHookLoadPackage {
                 val t = intent.getStringExtra(EXTRA_TOKEN)
                 val expected = authToken
                 if (t == null || expected == null || t != expected) {
-                    logAlways("AUTH_SUCCESS rejected: bad token")
+                    logAlways("AUTH rejected: bad token")
                     return
                 }
-                authToken = null // consume token
-                log("AUTH_SUCCESS verified")
+                authToken = null
+                authPending.set(false)
+                log("AUTH verified")
                 h.post { manualUnpin() }
             }
         }, IntentFilter(ACTION_AUTH_SUCCESS), null, h, Context.RECEIVER_EXPORTED)
+
+        // Auth timeout — reset pending state after 60s
+        h.postDelayed(object : Runnable {
+            override fun run() {
+                if (authPending.get() && authToken != null) {
+                    // Check if token is stale (set > 60s ago)
+                    authPending.set(false)
+                    authToken = null
+                    log("auth timeout, reset")
+                }
+                h.postDelayed(this, 60_000)
+            }
+        }, 60_000)
     }
 
     // ═══════════════════════════════════════════════════════════════
     //  target app hooks
     // ═══════════════════════════════════════════════════════════════
 
-    /** One-time auth token received from system_server via SHOW_AUTH */
     @Volatile private var pendingAuthToken: String? = null
 
     private fun hookTargetApp(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -261,7 +288,6 @@ class MainHook : IXposedHookLoadPackage {
                     val activity = param.thisObject as Activity
                     currentActivity = WeakReference(activity)
 
-                    // Register package
                     activity.sendBroadcast(
                         Intent(ACTION_REGISTER).putExtra(EXTRA_PKG, activity.packageName)
                     )
@@ -271,7 +297,6 @@ class MainHook : IXposedHookLoadPackage {
 
                     val receiver = object : BroadcastReceiver() {
                         override fun onReceive(ctx: Context, intent: Intent) {
-                            // Save the auth token from system_server
                             pendingAuthToken = intent.getStringExtra(EXTRA_TOKEN)
                             val act = currentActivity?.get() ?: return
                             log("SHOW_AUTH → ${act.javaClass.name}")
@@ -297,15 +322,23 @@ class MainHook : IXposedHookLoadPackage {
                         return
                     }
                     XposedHelpers.setAdditionalInstanceField(activity, tag, true)
-                    if (param.args[1] as Int == Activity.RESULT_OK) {
-                        // Send AUTH_SUCCESS with the token from system_server
+                    val token = pendingAuthToken
+                    pendingAuthToken = null
+                    if (param.args[1] as Int == Activity.RESULT_OK && token != null) {
                         activity.sendBroadcast(
                             Intent(ACTION_AUTH_SUCCESS)
                                 .setPackage("android")
-                                .putExtra(EXTRA_TOKEN, pendingAuthToken)
+                                .putExtra(EXTRA_TOKEN, token)
                         )
-                        pendingAuthToken = null
-                        log("AUTH_SUCCESS (verified)")
+                        log("AUTH_SUCCESS sent")
+                    } else {
+                        // Auth cancelled/failed — notify system_server to reset pending
+                        activity.sendBroadcast(
+                            Intent(ACTION_AUTH_SUCCESS)
+                                .setPackage("android")
+                                .putExtra(EXTRA_TOKEN, "cancelled")
+                        )
+                        log("auth cancelled")
                     }
                 }
             })
