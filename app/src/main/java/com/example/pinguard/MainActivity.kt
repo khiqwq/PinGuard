@@ -4,7 +4,9 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.SharedPreferences
 import android.os.Bundle
+import java.io.File
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -81,12 +83,21 @@ class MainActivity : ComponentActivity() {
                     enabled = prefs.getBoolean("enabled", true),
                     debugLog = prefs.getBoolean("debug_log", false),
                     hideExitToast = prefs.getBoolean("hide_exit_toast", false),
-                    onEnabledChange = { prefs.edit().putBoolean("enabled", it).apply() },
-                    onDebugLogChange = { prefs.edit().putBoolean("debug_log", it).apply() },
-                    onHideExitToastChange = { prefs.edit().putBoolean("hide_exit_toast", it).apply() }
+                    onEnabledChange = { prefs.edit().putBoolean("enabled", it).apply(); fixPerms() },
+                    onDebugLogChange = { prefs.edit().putBoolean("debug_log", it).apply(); fixPerms() },
+                    onHideExitToastChange = { prefs.edit().putBoolean("hide_exit_toast", it).apply(); fixPerms() }
                 )
             }
         }
+    }
+
+    private fun fixPerms() {
+        try {
+            val dir = File(applicationInfo.dataDir + "/shared_prefs")
+            dir.setExecutable(true, false)
+            dir.setReadable(true, false)
+            File(dir, "config.xml").setReadable(true, false)
+        } catch (_: Exception) {}
     }
 
     override fun onDestroy() {

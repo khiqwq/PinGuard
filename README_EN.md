@@ -1,12 +1,24 @@
+<div align="center">
+
+<img src="app/src/main/res/drawable/ic_launcher_foreground.xml" width="80" alt="icon" />
+
 # PinGuard
 
-LSPosed module that requires fingerprint/password verification to unpin screen-pinned apps.
+**LSPosed module — require fingerprint / password to unpin screen-pinned apps**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Android 15+](https://img.shields.io/badge/Android-15%2B-green.svg)](#requirements)
+[![LSPosed](https://img.shields.io/badge/LSPosed-Module-orange.svg)](#installation)
 
 [简体中文](README.md)
 
+</div>
+
+---
+
 ## Features
 
-- Intercepts screen unpin and requires system credential verification (fingerprint/PIN/pattern)
+- Intercepts screen unpin and requires system credential verification (fingerprint / PIN / pattern)
 - Goes directly to home screen after verification — **no lock screen**
 - Only protects apps in LSPosed scope; other apps unpin normally
 - Optional: suppress the system "To unpin this app..." toast
@@ -20,7 +32,7 @@ LSPosed module that requires fingerprint/password verification to unpin screen-p
 
 ## Installation
 
-1. Install PinGuard APK
+1. Download and install APK from [Releases](https://github.com/khiqwq/PinGuard/releases)
 2. Enable module in LSPosed Manager
 3. Select scope:
    - **System Framework (android)** — required
@@ -30,10 +42,10 @@ LSPosed module that requires fingerprint/password verification to unpin screen-p
 
 ## Usage
 
-1. Open a protected app and pin it (Screen Pinning)
+1. Open a protected app and enable Screen Pinning
 2. When trying to unpin, the system credential dialog appears
 3. Successful verification → unpins and returns to home
-4. Failed/cancelled → stays pinned
+4. Failed / cancelled → stays pinned
 
 ## Settings
 
@@ -45,9 +57,39 @@ LSPosed module that requires fingerprint/password verification to unpin screen-p
 
 ## How It Works
 
-1. Hooks `stopSystemLockTaskMode()` in `system_server` to intercept unpin requests
-2. Sends broadcast to the pinned app to show `KeyguardManager` credential verification
-3. On success, manually dismantles `LockTaskController` internal state, bypassing the system lock screen
+```
+User attempts to unpin
+        │
+        ▼
+  stopSystemLockTaskMode()  ← Hooked
+        │
+        ▼
+  Is app in protected list? ──No──▶ Allow normally
+        │Yes
+        ▼
+  Broadcast to pinned app
+        │
+        ▼
+  Show KeyguardManager credential dialog
+        │
+    ┌───┴───┐
+    ▼       ▼
+  Pass     Fail
+    │       │
+    ▼       ▼
+ Manually   Stay
+ dismantle  pinned
+ LockTask
+ internals
+    │
+    ▼
+ Return to home
+ (no lock screen)
+```
+
+## Related
+
+- [ImagePicker (钉图)](https://github.com/khiqwq/ImagePicker) — Minimal image viewer with screen pinning support
 
 ## 📄 License
 
