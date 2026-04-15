@@ -1,4 +1,4 @@
-package app.github.pinguard
+package io.github.khiqwq.pinguard
 
 import android.app.Activity
 import android.app.KeyguardManager
@@ -27,11 +27,11 @@ class MainHook : IXposedHookLoadPackage {
     companion object {
         const val TAG = "PinGuard"
         const val REQ = 0x5047
-        const val ACTION_SHOW_AUTH = "app.github.pinguard.SHOW_AUTH"
-        const val ACTION_AUTH_SUCCESS = "app.github.pinguard.AUTH_SUCCESS"
-        const val ACTION_REGISTER = "app.github.pinguard.REGISTER_APP"
-        const val ACTION_PING = "app.github.pinguard.PING"
-        const val ACTION_PONG = "app.github.pinguard.PONG"
+        const val ACTION_SHOW_AUTH = "io.github.khiqwq.pinguard.SHOW_AUTH"
+        const val ACTION_AUTH_SUCCESS = "io.github.khiqwq.pinguard.AUTH_SUCCESS"
+        const val ACTION_REGISTER = "io.github.khiqwq.pinguard.REGISTER_APP"
+        const val ACTION_PING = "io.github.khiqwq.pinguard.PING"
+        const val ACTION_PONG = "io.github.khiqwq.pinguard.PONG"
         const val EXTRA_TOKEN = "t"
         const val EXTRA_PKG = "pkg"
         const val MAX_PROTECTED = 100
@@ -66,7 +66,7 @@ class MainHook : IXposedHookLoadPackage {
 
     private fun loadPrefs(): XSharedPreferences? {
         return try {
-            val p = XSharedPreferences("app.github.pinguard", "config")
+            val p = XSharedPreferences("io.github.khiqwq.pinguard", "config")
             p.reload()
             debugLog = p.getBoolean("debug_log", false)
             p
@@ -85,7 +85,7 @@ class MainHook : IXposedHookLoadPackage {
         when {
             lpparam.packageName == "android" && lpparam.processName == "android" ->
                 hookSystemServer(lpparam)
-            lpparam.packageName != "app.github.pinguard" ->
+            lpparam.packageName != "io.github.khiqwq.pinguard" ->
                 hookTargetApp(lpparam)
         }
     }
