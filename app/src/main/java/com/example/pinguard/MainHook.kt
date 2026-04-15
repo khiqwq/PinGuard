@@ -50,8 +50,6 @@ class MainHook : IXposedHookLoadPackage {
 
     /** One-time token generated per auth session to prevent broadcast spoofing */
     @Volatile private var authToken: String? = null
-    /** Secret shared between system_server and hooked apps at hook load time */
-    private val sessionSecret = UUID.randomUUID().toString()
 
     // ── logging ─────────────────────────────────────────────────────
 
@@ -115,7 +113,7 @@ class MainHook : IXposedHookLoadPackage {
                         val ctx = XposedHelpers.getObjectField(
                             param.thisObject, "mContext") as Context
                         registerReceivers(ctx)
-                        logAlways("ready (secret=${sessionSecret.take(8)}...)")
+                        logAlways("ready")
                     }
                 })
         } catch (e: Exception) {
@@ -129,7 +127,10 @@ class MainHook : IXposedHookLoadPackage {
 
                 if (!isEnabled()) { log("disabled"); return }
                 if (authPassed.compareAndSet(true, false)) { log("auth OK"); return }
-                if (!isPinnedAppProtected(param.thisObject)) { log("not protected"); return }
+                val pinnedPkg = getPinnedAppPackage(param.thisObject)
+                if (pinnedPkg == null || pinnedPkg !in protectedPackages) {
+                    log("not protected ($pinnedPkg)"); return
+                }
 
                 hookedMethodName = param.method.name
                 if (atmsRef == null) atmsRef = param.thisObject
@@ -144,7 +145,12 @@ class MainHook : IXposedHookLoadPackage {
 
                 val callingId = Binder.clearCallingIdentity()
                 try {
-                    ctx.sendBroadcast(Intent(ACTION_SHOW_AUTH).putExtra(EXTRA_TOKEN, token))
+                    // Targeted broadcast — only the pinned app receives the token
+                    ctx.sendBroadcast(
+                        Intent(ACTION_SHOW_AUTH)
+                            .setPackage(pinnedPkg)
+                            .putExtra(EXTRA_TOKEN, token)
+                    )
                     if (isHideExitToast()) {
                         suppressToastUntil.set(System.currentTimeMillis() + 3000)
                     }
@@ -185,19 +191,12 @@ class MainHook : IXposedHookLoadPackage {
     // ── protected package tracking ──────────────────────────────────
 
     @Suppress("UNCHECKED_CAST")
-    private fun isPinnedAppProtected(atms: Any): Boolean {
-        if (protectedPackages.isEmpty()) return false
+    private fun getPinnedAppPackage(atms: Any): String? {
         return try {
             val ltc = XposedHelpers.getObjectField(atms, "mLockTaskController")
             val tasks = XposedHelpers.getObjectField(ltc, "mLockTaskModeTasks") as? ArrayList<Any>
-            if (tasks.isNullOrEmpty()) return false
-            val pkg = getTaskPackage(tasks.last())
-            log("pinned=$pkg scope=$protectedPackages")
-            pkg != null && pkg in protectedPackages
-        } catch (e: Exception) {
-            log("check err: ${e.message}")
-            false
-        }
+            if (tasks.isNullOrEmpty()) null else getTaskPackage(tasks.last())
+        } catch (_: Exception) { null }
     }
 
     private fun getTaskPackage(task: Any): String? {
@@ -215,18 +214,16 @@ class MainHook : IXposedHookLoadPackage {
     private fun registerReceivers(ctx: Context) {
         val h = handler ?: return
 
-        // PING/PONG — include secret so only our module responds
+        // PING/PONG for module status check
         ctx.registerReceiver(object : BroadcastReceiver() {
             override fun onReceive(c: Context, i: Intent) {
-                if (i.getStringExtra(EXTRA_TOKEN) != sessionSecret) return
                 c.sendBroadcast(Intent(ACTION_PONG))
             }
         }, IntentFilter(ACTION_PING), null, h, Context.RECEIVER_EXPORTED)
 
-        // App registration — validate secret
+        // App registration (low-risk: worst case adds app to protected list)
         ctx.registerReceiver(object : BroadcastReceiver() {
             override fun onReceive(c: Context, intent: Intent) {
-                if (intent.getStringExtra(EXTRA_TOKEN) != sessionSecret) return
                 val pkg = intent.getStringExtra(EXTRA_PKG) ?: return
                 if (protectedPackages.add(pkg)) log("protected +$pkg")
             }
@@ -252,8 +249,8 @@ class MainHook : IXposedHookLoadPackage {
     //  target app hooks
     // ═══════════════════════════════════════════════════════════════
 
-    /** Session secret injected by Xposed — shared in-memory, not broadcast */
-    private var appSecret: String? = null
+    /** One-time auth token received from system_server via SHOW_AUTH */
+    @Volatile private var pendingAuthToken: String? = null
 
     private fun hookTargetApp(lpparam: XC_LoadPackage.LoadPackageParam) {
         log("hookTarget ${lpparam.packageName}")
@@ -264,11 +261,9 @@ class MainHook : IXposedHookLoadPackage {
                     val activity = param.thisObject as Activity
                     currentActivity = WeakReference(activity)
 
-                    // Register package with secret
+                    // Register package
                     activity.sendBroadcast(
-                        Intent(ACTION_REGISTER)
-                            .putExtra(EXTRA_PKG, activity.packageName)
-                            .putExtra(EXTRA_TOKEN, sessionSecret)
+                        Intent(ACTION_REGISTER).putExtra(EXTRA_PKG, activity.packageName)
                     )
 
                     if (XposedHelpers.getAdditionalInstanceField(activity, "pg") != null) return
@@ -277,7 +272,7 @@ class MainHook : IXposedHookLoadPackage {
                     val receiver = object : BroadcastReceiver() {
                         override fun onReceive(ctx: Context, intent: Intent) {
                             // Save the auth token from system_server
-                            appSecret = intent.getStringExtra(EXTRA_TOKEN)
+                            pendingAuthToken = intent.getStringExtra(EXTRA_TOKEN)
                             val act = currentActivity?.get() ?: return
                             log("SHOW_AUTH → ${act.javaClass.name}")
                             showAuth(act)
@@ -305,9 +300,11 @@ class MainHook : IXposedHookLoadPackage {
                     if (param.args[1] as Int == Activity.RESULT_OK) {
                         // Send AUTH_SUCCESS with the token from system_server
                         activity.sendBroadcast(
-                            Intent(ACTION_AUTH_SUCCESS).putExtra(EXTRA_TOKEN, appSecret)
+                            Intent(ACTION_AUTH_SUCCESS)
+                                .setPackage("android")
+                                .putExtra(EXTRA_TOKEN, pendingAuthToken)
                         )
-                        appSecret = null
+                        pendingAuthToken = null
                         log("AUTH_SUCCESS (verified)")
                     }
                 }
@@ -376,8 +373,10 @@ class MainHook : IXposedHookLoadPackage {
         val km = activity.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
         if (!km.isKeyguardSecure) {
             activity.sendBroadcast(
-                Intent(ACTION_AUTH_SUCCESS).putExtra(EXTRA_TOKEN, appSecret))
-            appSecret = null
+                Intent(ACTION_AUTH_SUCCESS)
+                    .setPackage("android")
+                    .putExtra(EXTRA_TOKEN, pendingAuthToken))
+            pendingAuthToken = null
             return
         }
         @Suppress("DEPRECATION")
@@ -387,8 +386,10 @@ class MainHook : IXposedHookLoadPackage {
             activity.startActivityForResult(intent, REQ)
         } else {
             activity.sendBroadcast(
-                Intent(ACTION_AUTH_SUCCESS).putExtra(EXTRA_TOKEN, appSecret))
-            appSecret = null
+                Intent(ACTION_AUTH_SUCCESS)
+                    .setPackage("android")
+                    .putExtra(EXTRA_TOKEN, pendingAuthToken))
+            pendingAuthToken = null
         }
     }
 }
