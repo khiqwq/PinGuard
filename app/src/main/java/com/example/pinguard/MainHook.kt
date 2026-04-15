@@ -144,24 +144,27 @@ class MainHook : IXposedHookLoadPackage {
             }
         }
 
-        // Optionally suppress exit hint toast
+        // Optionally suppress only the "how to unpin" toast
         try {
-            val ltcClass = XposedHelpers.findClass(
-                "com.android.server.wm.LockTaskController", lpparam.classLoader
-            )
-            for (method in ltcClass.declaredMethods) {
-                if (method.name == "showLockTaskToast") {
-                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            val p = reloadPrefs()
-                            if (p?.getBoolean("hide_exit_toast", false) == true) {
+            XposedHelpers.findAndHookMethod("android.widget.Toast", lpparam.classLoader,
+                "show", object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val p = reloadPrefs()
+                        if (p?.getBoolean("hide_exit_toast", false) != true) return
+                        try {
+                            val view = XposedHelpers.callMethod(param.thisObject, "getView")
+                            val tv = XposedHelpers.callMethod(view, "findViewById",
+                                android.R.id.message) as? android.widget.TextView
+                            val text = tv?.text?.toString() ?: ""
+                            if (text.contains("取消固定") || text.contains("unpin") ||
+                                text.contains("Unpin") || text.contains("取消锁定")) {
+                                log("suppressed exit toast")
                                 param.setResult(null)
                             }
-                        }
-                    })
-                    log("hooked showLockTaskToast ✓")
-                }
-            }
+                        } catch (_: Exception) {}
+                    }
+                })
+            log("hooked Toast.show ✓")
         } catch (_: Exception) {}
     }
 
