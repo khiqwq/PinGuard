@@ -56,10 +56,12 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
 
+        var prefsFallback = false
         val prefs = try {
             @Suppress("DEPRECATION")
             getSharedPreferences("config", Context.MODE_WORLD_READABLE)
         } catch (_: SecurityException) {
+            prefsFallback = true
             getSharedPreferences("config", Context.MODE_PRIVATE)
         }
 
@@ -80,12 +82,13 @@ class MainActivity : ComponentActivity() {
                 val isActive by moduleActive
                 SettingsScreen(
                     moduleActive = isActive,
+                    prefsFallback = prefsFallback,
                     enabled = prefs.getBoolean("enabled", true),
                     debugLog = prefs.getBoolean("debug_log", false),
                     hideExitToast = prefs.getBoolean("hide_exit_toast", false),
-                    onEnabledChange = { prefs.edit().putBoolean("enabled", it).apply(); fixPerms() },
-                    onDebugLogChange = { prefs.edit().putBoolean("debug_log", it).apply(); fixPerms() },
-                    onHideExitToastChange = { prefs.edit().putBoolean("hide_exit_toast", it).apply(); fixPerms() }
+                    onEnabledChange = { prefs.edit().putBoolean("enabled", it).commit(); fixPerms() },
+                    onDebugLogChange = { prefs.edit().putBoolean("debug_log", it).commit(); fixPerms() },
+                    onHideExitToastChange = { prefs.edit().putBoolean("hide_exit_toast", it).commit(); fixPerms() }
                 )
             }
         }
@@ -132,6 +135,7 @@ private fun ToggleCard(
 @Composable
 fun SettingsScreen(
     moduleActive: Boolean,
+    prefsFallback: Boolean = false,
     enabled: Boolean,
     debugLog: Boolean,
     hideExitToast: Boolean,
@@ -180,6 +184,21 @@ fun SettingsScreen(
                             fontSize = 13.sp, color = Color.Gray
                         )
                     }
+                }
+            }
+
+            if (prefsFallback) {
+                Spacer(Modifier.height(8.dp))
+                Card(
+                    Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3E0))
+                ) {
+                    Text(
+                        "设置可能无法同步到模块（MODE_WORLD_READABLE 不可用）。" +
+                            "开关变更需重启后生效。",
+                        fontSize = 13.sp, color = Color(0xFFE65100),
+                        modifier = Modifier.padding(16.dp)
+                    )
                 }
             }
 

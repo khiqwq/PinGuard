@@ -163,7 +163,7 @@ class MainHook : IXposedHookLoadPackage {
                     if (isHideExitToast()) {
                         suppressToastUntil.set(System.currentTimeMillis() + 3000)
                     }
-                    log("blocked, token=${token.take(8)}")
+                    log("blocked")
                     param.setResult(null)
                 } catch (e: Exception) {
                     authPending.set(false)
@@ -243,10 +243,17 @@ class MainHook : IXposedHookLoadPackage {
             }
         }, IntentFilter(ACTION_REGISTER), null, h, Context.RECEIVER_EXPORTED)
 
-        // Auth success — validate one-time token
+        // Auth success / cancelled — validate one-time token
         ctx.registerReceiver(object : BroadcastReceiver() {
             override fun onReceive(c: Context, intent: Intent) {
                 val t = intent.getStringExtra(EXTRA_TOKEN)
+                // Handle cancellation — reset pending so user can retry immediately
+                if (t == "cancelled") {
+                    authToken = null
+                    authPending.set(false)
+                    log("AUTH cancelled, reset")
+                    return
+                }
                 val expected = authToken
                 if (t == null || expected == null || t != expected) {
                     logAlways("AUTH rejected: bad token")
