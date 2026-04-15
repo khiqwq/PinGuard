@@ -73,7 +73,7 @@ class MainActivity : ComponentActivity() {
             IntentFilter("com.example.pinguard.PONG"),
             Context.RECEIVER_EXPORTED
         )
-        sendBroadcast(Intent("com.example.pinguard.PING"))
+        sendBroadcast(Intent("com.example.pinguard.PING").putExtra("pkg", packageName))
 
         setContent {
             MaterialTheme(colorScheme = lightColorScheme()) {
