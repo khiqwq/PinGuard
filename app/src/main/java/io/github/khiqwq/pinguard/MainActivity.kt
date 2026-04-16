@@ -123,15 +123,18 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {}
     }
 
-    // Heartbeat timestamp from SystemUI's hook must post-date the last boot.
-    // Re-read on each resume so an app opened within ~3s of boot (before
-    // SysUI writes its first heartbeat) eventually clears the false warning.
+    // Ping SysUI and check whether it refreshes the heartbeat within 500ms.
+    // If SysUI scope is disabled (or SysUI was restarted without our hook
+    // reloading), no receiver will refresh the timestamp.
     private fun refreshSystemUIHooked() {
-        systemUIHooked.value = try {
-            val ts = Settings.Global.getLong(contentResolver, "pg_systemui_hooked", 0L)
-            val bootTime = System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime()
-            ts > bootTime
-        } catch (_: Exception) { false }
+        val pingSentAt = System.currentTimeMillis()
+        sendBroadcast(Intent("io.github.khiqwq.pinguard.PING_SYSUI").setPackage("com.android.systemui"))
+        android.os.Handler(mainLooper).postDelayed({
+            systemUIHooked.value = try {
+                val ts = Settings.Global.getLong(contentResolver, "pg_systemui_hooked", 0L)
+                ts >= pingSentAt
+            } catch (_: Exception) { false }
+        }, 500)
     }
 
     override fun onResume() {

@@ -46,6 +46,7 @@ class MainHook : IXposedHookLoadPackage {
         const val MODULE_VERSION = 4 // MUST match versionCode in build.gradle.kts
         const val SETTINGS_SUPPRESS_KEY = "pg_suppress_reshow_until"
         const val SETTINGS_SYSUI_READY_KEY = "pg_systemui_hooked"
+        const val ACTION_PING_SYSUI = "io.github.khiqwq.pinguard.PING_SYSUI"
     }
 
     // ── state ───────────────────────────────────────────────────────
@@ -120,18 +121,30 @@ class MainHook : IXposedHookLoadPackage {
     private fun hookSystemUI(lpparam: XC_LoadPackage.LoadPackageParam) {
         logAlways("hookSystemUI")
 
-        // Write a heartbeat timestamp once Application is ready, so MainActivity
-        // can detect whether the SystemUI scope is actually active.
+        // Delayed: once Application is ready, register a PING_SYSUI receiver.
+        // MainActivity broadcasts PING_SYSUI and checks if the heartbeat
+        // timestamp was refreshed within the ping window — reliable even
+        // after SysUI-only restarts (without full device reboot).
         Handler(Looper.getMainLooper()).postDelayed({
             try {
                 val at = Class.forName("android.app.ActivityThread")
                 val app = at.getMethod("currentApplication").invoke(null) as? android.app.Application
-                app?.contentResolver?.let {
-                    Settings.Global.putLong(
-                        it, SETTINGS_SYSUI_READY_KEY, System.currentTimeMillis())
-                    log("wrote SysUI heartbeat")
-                }
-            } catch (e: Exception) { log("heartbeat fail: ${e.message}") }
+                    ?: return@postDelayed
+                val cr = app.contentResolver
+                Settings.Global.putLong(
+                    cr, SETTINGS_SYSUI_READY_KEY, System.currentTimeMillis())
+                app.registerReceiver(object : BroadcastReceiver() {
+                    override fun onReceive(c: Context, i: Intent) {
+                        try {
+                            Settings.Global.putLong(
+                                c.contentResolver,
+                                SETTINGS_SYSUI_READY_KEY,
+                                System.currentTimeMillis())
+                        } catch (_: Exception) {}
+                    }
+                }, IntentFilter(ACTION_PING_SYSUI), null, null, Context.RECEIVER_EXPORTED)
+                log("SysUI PING receiver registered")
+            } catch (e: Exception) { log("SysUI receiver fail: ${e.message}") }
         }, 3000)
 
         val kvmClass = try {
