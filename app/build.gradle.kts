@@ -12,8 +12,8 @@ android {
         applicationId = "io.github.khiqwq.pinguard"
         minSdk = 35
         targetSdk = 36
-        versionCode = 3
-        versionName = "1.1.2"
+        versionCode = 4
+        versionName = "1.1.3"
     }
 
     compileOptions {

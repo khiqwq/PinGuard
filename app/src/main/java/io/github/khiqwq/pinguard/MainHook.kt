@@ -10,6 +10,7 @@ import android.content.IntentFilter
 import android.os.Binder
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.view.WindowManager
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
@@ -42,7 +43,9 @@ class MainHook : IXposedHookLoadPackage {
         const val FIELD_PG = "pg"
         const val FIELD_PG_RECEIVER = "pg_r"
         const val FIELD_PG_HANDLED = "pg_handled"
-        const val MODULE_VERSION = 3 // MUST match versionCode in build.gradle.kts
+        const val MODULE_VERSION = 4 // MUST match versionCode in build.gradle.kts
+        const val SETTINGS_SUPPRESS_KEY = "pg_suppress_reshow_until"
+        const val SETTINGS_SYSUI_READY_KEY = "pg_systemui_hooked"
     }
 
     // ── state ───────────────────────────────────────────────────────
@@ -103,9 +106,116 @@ class MainHook : IXposedHookLoadPackage {
         when {
             lpparam.packageName == "android" && lpparam.processName == "android" ->
                 hookSystemServer(lpparam)
+            lpparam.packageName == "com.android.systemui" ->
+                hookSystemUI(lpparam)
             lpparam.packageName != "io.github.khiqwq.pinguard" ->
                 hookTargetApp(lpparam)
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  SystemUI hooks — suppress KVM reshow after unpin
+    // ═══════════════════════════════════════════════════════════════
+
+    private fun hookSystemUI(lpparam: XC_LoadPackage.LoadPackageParam) {
+        logAlways("hookSystemUI")
+
+        // Write a heartbeat timestamp once Application is ready, so MainActivity
+        // can detect whether the SystemUI scope is actually active.
+        Handler(Looper.getMainLooper()).postDelayed({
+            try {
+                val at = Class.forName("android.app.ActivityThread")
+                val app = at.getMethod("currentApplication").invoke(null) as? android.app.Application
+                app?.contentResolver?.let {
+                    Settings.Global.putLong(
+                        it, SETTINGS_SYSUI_READY_KEY, System.currentTimeMillis())
+                    log("wrote SysUI heartbeat")
+                }
+            } catch (e: Exception) { log("heartbeat fail: ${e.message}") }
+        }, 3000)
+
+        val kvmClass = try {
+            XposedHelpers.findClass(
+                "com.android.systemui.keyguard.KeyguardViewMediator", lpparam.classLoader)
+        } catch (e: Exception) {
+            logAlways("KVM class not found: ${e.message}"); return
+        }
+
+        // Walk up class hierarchy to collect all methods
+        val allMethods = mutableListOf<java.lang.reflect.Method>()
+        var c: Class<*>? = kvmClass
+        while (c != null && c != Any::class.java) {
+            allMethods.addAll(c.declaredMethods)
+            c = c.superclass
+        }
+
+        // Hook suspect methods that can trigger keyguard show
+        // Key strategy: cover all re-enable/show paths on HyperOS KVM
+        var hookedCount = 0
+        val showBlocker = object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                // Outer try/catch: never let an exception propagate into KVM —
+                // a crash here can destabilize SystemUI / lockscreen state.
+                try {
+                    if (!shouldSuppressReshow(param.thisObject)) return
+                    if (param.method.name.startsWith("setKeyguardEnabled") &&
+                        param.args.isNotEmpty() && param.args[0] == true) {
+                        try {
+                            XposedHelpers.setBooleanField(
+                                param.thisObject, "mNeedToReshowWhenReenabled", false)
+                            logAlways("KVM: cleared reshow flag in ${param.method.name}")
+                        } catch (_: Exception) {}
+                        return
+                    }
+                    param.setResult(null)
+                    logAlways("KVM: skipped ${param.method.name}")
+                } catch (e: Throwable) {
+                    logAlways("KVM hook fault in ${param.method.name}: ${e.message}")
+                }
+            }
+        }
+
+        val targetNames = setOf(
+            "setKeyguardEnabled",
+            "doKeyguardLocked",
+            "doKeyguardForChildProfilesLocked",
+            "showLocked",
+            "handleShow",
+            "showKeyguard",
+            "maybeHandlePendingLock")
+
+        // Diagnostic (debug_log only): list KVM methods matching keyguard/show/lock
+        // patterns — useful when HyperOS renames/adds methods in future updates.
+        if (debugLog) {
+            val suspectNames = allMethods.asSequence()
+                .map { it.name }
+                .filter { it.contains("eyguard", true) || it.contains("how", true) || it.contains("ock", true) }
+                .distinct().sorted().toList()
+            log("KVM suspect methods (${suspectNames.size}): ${suspectNames.joinToString(",")}")
+        }
+
+        for (method in allMethods) {
+            if (method.name !in targetNames) continue
+            if (java.lang.reflect.Modifier.isAbstract(method.modifiers)) continue
+            try {
+                XposedBridge.hookMethod(method, showBlocker)
+                logAlways("hooked KVM.${method.name}(${method.parameterTypes.joinToString(",") { it.simpleName }}) ✓")
+                hookedCount++
+            } catch (e: Exception) {
+                log("hook ${method.name} fail: ${e.message}")
+            }
+        }
+        logAlways("KVM hooks installed: $hookedCount")
+    }
+
+    // Signal from system_server via Settings.Global: unpin in progress, skip reshow
+    private fun shouldSuppressReshow(kvm: Any): Boolean {
+        try {
+            val ctx = XposedHelpers.getObjectField(kvm, "mContext") as Context
+            val until = Settings.Global.getLong(
+                ctx.contentResolver, SETTINGS_SUPPRESS_KEY, 0L)
+            return System.currentTimeMillis() < until
+        } catch (_: Exception) { return false }
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -132,6 +242,16 @@ class MainHook : IXposedHookLoadPackage {
                             handler = Handler(Looper.getMainLooper())
                             val ctx = XposedHelpers.getObjectField(
                                 param.thisObject, "mContext") as Context
+                            // Clear any stale suppress-reshow signal left over from
+                            // a crash or reboot during unpin. Also clear the SysUI
+                            // heartbeat — if SysUI scope is still enabled, it will
+                            // rewrite a fresh timestamp 3s after its hook loads.
+                            try {
+                                Settings.Global.putLong(
+                                    ctx.contentResolver, SETTINGS_SUPPRESS_KEY, 0L)
+                                Settings.Global.putLong(
+                                    ctx.contentResolver, SETTINGS_SYSUI_READY_KEY, 0L)
+                            } catch (_: Exception) {}
                             registerReceivers(ctx)
                             logAlways("ready")
                         } catch (e: Exception) {
@@ -205,42 +325,25 @@ class MainHook : IXposedHookLoadPackage {
             }
         }
 
-        // 3. Prevent keyguard after unpin — TWO paths need blocking:
+        // 3. Prevent keyguard RESHOW after unpin.
         //
-        // Path A (actual on HyperOS):
-        //   performStopLockTask → setKeyguardState → reenableKeyguard
-        //     → enableKeyguard(true) → KeyguardViewMediator: "previously hidden, reshowing"
-        //   Fix: hook enableKeyguard, block true during suppress window
+        // Background: performStopLockTask → setKeyguardState(NONE) → reenableKeyguard
+        //   → PhoneWindowManager.enableKeyguard(true) → KeyguardServiceDelegate
+        //   → KVM.setKeyguardEnabled(true) → sets mExternallyEnabled = true
         //
-        // Path B (AOSP fallback):
-        //   performStopLockTask → lockKeyguardIfNeeded → shouldLockKeyguard → lockNow
-        //   Fix: hook shouldLockKeyguard, return false
-
-        // Path A: enableKeyguard(true) — the REAL trigger on HyperOS
-        try {
-            val pwmClass = XposedHelpers.findClass(
-                "com.android.server.policy.PhoneWindowManager", lpparam.classLoader)
-            for (method in pwmClass.declaredMethods) {
-                if (method.name == "enableKeyguard") {
-                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (!isBypassLockscreen()) return
-                            if (System.currentTimeMillis() >= suppressKeyguardUntil.get()) return
-                            val enable = param.args.firstOrNull()
-                            if (enable is Boolean && enable) {
-                                param.setResult(null) // skip entirely
-                                logAlways("blocked enableKeyguard(true)")
-                            }
-                        }
-                    })
-                    logAlways("hooked PWM.enableKeyguard ✓")
-                }
-            }
-        } catch (e: Exception) {
-            logAlways("enableKeyguard hook fail: ${e.message}")
-        }
-
-        // Path B: shouldLockKeyguard — fallback for lockNow path
+        // Old (broken) approach: blocked enableKeyguard(true) at PWM level. This left
+        //   mExternallyEnabled = false permanently, stalling KeyguardServiceDelegate's
+        //   disabler-token state. HyperOS MIUI services (clipboard/brightness) that
+        //   re-latch pinned state on screen-on events then never received a clean
+        //   LOCK_TASK_MODE_NONE refresh.
+        //
+        // New approach: let enableKeyguard(true) flow through for state sync. Block
+        //   only the KVM show path (KVM.doKeyguardLocked) in SystemUI scope — OR
+        //   dismiss keyguard after it shows. For now, rely on the fact that on a
+        //   live/unlocked device, enableKeyguard(true) only sets flags and does NOT
+        //   immediately show the keyguard UI; reshow happens on next screen-off.
+        //
+        // Keep shouldLockKeyguard hook (AOSP fallback path: lockKeyguardIfNeeded → lockNow)
         try {
             val ltcClass = XposedHelpers.findClass(
                 "com.android.server.wm.LockTaskController", lpparam.classLoader)
@@ -664,19 +767,42 @@ class MainHook : IXposedHookLoadPackage {
     //  manual unpin (bypass keyguard)
     // ═══════════════════════════════════════════════════════════════
 
+    // Run the REAL stopSystemLockTaskMode for full cleanup (IME, WM, brightness,
+    // DevicePolicy, TaskChangeNotificationController). Rely on enableKeyguard +
+    // shouldLockKeyguard hooks to suppress keyguard during the call.
+    //
+    // Previous impl manually cleared mLockTaskModeTasks + mLockTaskModeState, but
+    // skipped LockTaskController.setLockTaskModeState() internal notifications,
+    // leaving IME in ephemeral-keyboard mode (no clipboard) and DisplayPolicy
+    // in dimmed brightness — especially after screen off/on events during pin.
     @Suppress("UNCHECKED_CAST")
     private fun manualUnpin() {
         val callingId = Binder.clearCallingIdentity()
         try {
-            // Set suppress BEFORE clearing tasks (performStopLockTask is async)
             if (isBypassLockscreen()) {
                 suppressKeyguardUntil.set(System.currentTimeMillis() + KEYGUARD_SUPPRESS_MS)
+                // Signal SystemUI KVM hook to skip reshow during upcoming enableKeyguard(true)
+                try {
+                    val ctx = XposedHelpers.getObjectField(atmsRef, "mContext") as Context
+                    Settings.Global.putLong(ctx.contentResolver, SETTINGS_SUPPRESS_KEY,
+                        System.currentTimeMillis() + KEYGUARD_SUPPRESS_MS)
+                } catch (e: Exception) { log("suppress signal fail: ${e.message}") }
+            }
+            authPassed.set(true)
+            try {
+                XposedHelpers.callMethod(
+                    atmsRef, hookedMethodName ?: "stopSystemLockTaskMode")
+                log("unpin OK via original")
+                return
+            } catch (e: Exception) {
+                logAlways("original unpin fail: ${e.message}, fallback to manual clear")
             }
 
+            // Fallback: manual clear if original call fails. State notifications
+            // won't fire, but at least the app exits pin mode.
             val globalLock = XposedHelpers.getObjectField(atmsRef, "mGlobalLock")
             synchronized(globalLock) {
                 val ltc = XposedHelpers.getObjectField(atmsRef, "mLockTaskController")
-
                 try {
                     val tasks = XposedHelpers.getObjectField(
                         ltc, "mLockTaskModeTasks") as ArrayList<Any>
@@ -686,10 +812,8 @@ class MainHook : IXposedHookLoadPackage {
                     }
                     tasks.clear()
                 } catch (e: Exception) { log("clearTasks: ${e.message}") }
-
                 try { XposedHelpers.setIntField(ltc, "mLockTaskModeState", 0) }
                 catch (_: Exception) {}
-
                 try {
                     val sb = XposedHelpers.callMethod(ltc, "getStatusBarService")
                     sb.javaClass.getMethod(
@@ -697,13 +821,6 @@ class MainHook : IXposedHookLoadPackage {
                     ).invoke(sb, 0)
                 } catch (_: Exception) {}
             }
-            log("unpin OK")
-        } catch (e: Exception) {
-            logAlways("unpin FAIL: ${e.message}")
-            authPassed.set(true)
-            try { XposedHelpers.callMethod(
-                atmsRef, hookedMethodName ?: "stopSystemLockTaskMode") }
-            catch (_: Exception) {}
         } finally {
             Binder.restoreCallingIdentity(callingId)
         }

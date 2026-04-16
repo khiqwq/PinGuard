@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.os.Bundle
+import android.provider.Settings
 import java.io.File
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -51,6 +52,7 @@ class MainActivity : ComponentActivity() {
 
     private val moduleActive = mutableStateOf(false)
     private val needsReboot = mutableStateOf(false)
+    private val systemUIHooked = mutableStateOf(false)
     private var pongReceiver: BroadcastReceiver? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -84,13 +86,17 @@ class MainActivity : ComponentActivity() {
         fixPerms()
         sendBroadcast(Intent("io.github.khiqwq.pinguard.PING").putExtra("pkg", packageName))
 
+        refreshSystemUIHooked()
+
         setContent {
             MaterialTheme(colorScheme = lightColorScheme()) {
                 val isActive by moduleActive
                 val reboot by needsReboot
+                val sysuiOk by systemUIHooked
                 SettingsScreen(
                     moduleActive = isActive,
                     needsReboot = reboot,
+                    systemUIHooked = sysuiOk,
                     enabled = prefs.getBoolean("enabled", true),
                     bypassLockscreen = prefs.getBoolean("bypass_lockscreen", true),
                     blockScreenshot = prefs.getBoolean("block_screenshot", false),
@@ -115,6 +121,22 @@ class MainActivity : ComponentActivity() {
             dir.setReadable(true, false)
             File(dir, "config.xml").setReadable(true, false)
         } catch (_: Exception) {}
+    }
+
+    // Heartbeat timestamp from SystemUI's hook must post-date the last boot.
+    // Re-read on each resume so an app opened within ~3s of boot (before
+    // SysUI writes its first heartbeat) eventually clears the false warning.
+    private fun refreshSystemUIHooked() {
+        systemUIHooked.value = try {
+            val ts = Settings.Global.getLong(contentResolver, "pg_systemui_hooked", 0L)
+            val bootTime = System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime()
+            ts > bootTime
+        } catch (_: Exception) { false }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshSystemUIHooked()
     }
 
     override fun onDestroy() {
@@ -150,6 +172,7 @@ private fun ToggleCard(
 fun SettingsScreen(
     moduleActive: Boolean,
     needsReboot: Boolean = false,
+    systemUIHooked: Boolean = true,
     enabled: Boolean,
     bypassLockscreen: Boolean,
     blockScreenshot: Boolean,
@@ -199,7 +222,7 @@ fun SettingsScreen(
                 }
                 else -> {
                     statusBg = Color(0xFFFFEBEE); statusDot = Color(0xFFE53935)
-                    statusTitle = "模块未激活"; statusDesc = "请在 LSPosed 中启用，作用域选「系统框架」，然后重启"
+                    statusTitle = "模块未激活"; statusDesc = "请在 LSPosed 中启用，作用域勾选「系统框架」，然后重启"
                 }
             }
             Card(
@@ -234,6 +257,20 @@ fun SettingsScreen(
                 isBypassLockscreen = it; onBypassLockscreenChange(it)
             }
 
+            if (isBypassLockscreen && !systemUIHooked) {
+                Spacer(Modifier.height(8.dp))
+                Card(
+                    Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3E0))
+                ) {
+                    Text(
+                        "⚠ 此功能需额外勾选「系统界面」作用域，否则取消固定后会闪现锁屏。\n在 LSPosed 中为本模块添加 com.android.systemui 到作用域并重启。",
+                        fontSize = 13.sp, lineHeight = 19.sp, color = Color(0xFF8D6E00),
+                        modifier = Modifier.padding(16.dp)
+                    )
+                }
+            }
+
             Spacer(Modifier.height(12.dp))
 
             ToggleCard("禁用截图", "应用固定期间禁止截图（优先级高于 HyperCeiler 允许截屏）", isBlockScreenshot) {
@@ -262,9 +299,10 @@ fun SettingsScreen(
                 Text(
                     "1. 在 LSPosed 中启用本模块\n" +
                         "2. 作用域勾选「系统框架」+ 需要保护的应用\n" +
-                        "3. 重启设备\n" +
-                        "4. 回到本页确认绿灯亮起\n" +
-                        "5. 固定受保护的应用后，取消固定需验证",
+                        "3. 如启用「解锁不回锁屏」，另需勾选「系统界面」\n" +
+                        "4. 重启设备\n" +
+                        "5. 回到本页确认绿灯亮起\n" +
+                        "6. 固定受保护的应用后，取消固定需验证",
                     fontSize = 14.sp, lineHeight = 24.sp, color = Color(0xFF555555),
                     modifier = Modifier.padding(20.dp)
                 )

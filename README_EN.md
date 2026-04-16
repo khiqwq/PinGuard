@@ -36,6 +36,7 @@
 2. Enable module in LSPosed Manager
 3. Select scope:
    - **System Framework (android)** — required
+   - **System UI (com.android.systemui)** — only required when "Skip lockscreen after unlock" is enabled
    - **Apps to protect** — select as needed
 4. Reboot
 5. Open PinGuard and confirm the green status indicator
@@ -52,6 +53,9 @@
 | Option | Description |
 |--------|-------------|
 | Enable Protection | Master switch; disabling allows normal unpin |
+| Skip Lockscreen After Unlock | Return directly to home after auth, skip the lockscreen (requires System UI scope) |
+| Block Screenshots | Disable screenshots while app is pinned (overrides HyperCeiler's force-allow) |
+| Block Voice Assistant | Disable Xiao AI / voice-assistant shortcuts while pinned |
 | Hide Exit Toast | Suppress the system "To unpin..." toast |
 | Debug Log | Output verbose logs to logcat (filter: `PinGuard`) |
 
@@ -77,10 +81,12 @@ User attempts to unpin
   Pass     Fail
     │       │
     ▼       ▼
- Manually   Stay
- dismantle  pinned
- LockTask
- internals
+ Invoke       Stay
+ original     pinned
+ stopSystem
+ LockTaskMode
+  + suppress
+   KVM reshow
     │
     ▼
  Return to home
