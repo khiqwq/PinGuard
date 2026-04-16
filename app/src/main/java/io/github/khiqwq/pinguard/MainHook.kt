@@ -36,6 +36,12 @@ class MainHook : IXposedHookLoadPackage {
         const val EXTRA_TOKEN = "t"
         const val EXTRA_PKG = "pkg"
         const val MAX_PROTECTED = 100
+        const val TOAST_SUPPRESS_MS = 3000L
+        const val KEYGUARD_SUPPRESS_MS = 5000L
+        const val AUTH_TIMEOUT_MS = 60000L
+        const val FIELD_PG = "pg"
+        const val FIELD_PG_RECEIVER = "pg_r"
+        const val FIELD_PG_HANDLED = "pg_handled"
     }
 
     // ── state ───────────────────────────────────────────────────────
@@ -49,7 +55,7 @@ class MainHook : IXposedHookLoadPackage {
     private var currentActivity: WeakReference<Activity>? = null
     private val protectedPackages: MutableSet<String> =
         Collections.synchronizedSet(HashSet())
-    private var debugLog = false
+    @Volatile private var debugLog = false
 
     @Volatile private var authToken: String? = null
     private val suppressKeyguardUntil = AtomicLong(0)
@@ -120,12 +126,16 @@ class MainHook : IXposedHookLoadPackage {
             XposedHelpers.findAndHookMethod(atmsClass, "onSystemReady",
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        atmsRef = param.thisObject
-                        handler = Handler(Looper.getMainLooper())
-                        val ctx = XposedHelpers.getObjectField(
-                            param.thisObject, "mContext") as Context
-                        registerReceivers(ctx)
-                        logAlways("ready")
+                        try {
+                            atmsRef = param.thisObject
+                            handler = Handler(Looper.getMainLooper())
+                            val ctx = XposedHelpers.getObjectField(
+                                param.thisObject, "mContext") as Context
+                            registerReceivers(ctx)
+                            logAlways("ready")
+                        } catch (e: Exception) {
+                            logAlways("onSystemReady FAIL: ${e.message}")
+                        }
                     }
                 })
         } catch (e: Exception) {
@@ -172,7 +182,7 @@ class MainHook : IXposedHookLoadPackage {
                             .putExtra(EXTRA_TOKEN, token)
                     )
                     if (isHideExitToast()) {
-                        suppressToastUntil.set(System.currentTimeMillis() + 3000)
+                        suppressToastUntil.set(System.currentTimeMillis() + TOAST_SUPPRESS_MS)
                     }
                     log("blocked")
                     param.setResult(null)
@@ -263,7 +273,7 @@ class MainHook : IXposedHookLoadPackage {
                 })
         } catch (_: Exception) {}
 
-        // 5. Screenshot blocking — multi-layer, HyperCeiler compatible
+        // 4. Screenshot blocking — multi-layer, HyperCeiler compatible
         //
         // Layer 1: Block screenshot initiation (system_server)
         // Layer 2: Override HyperCeiler's FLAG_SECURE bypass (afterHook wins)
@@ -333,7 +343,7 @@ class MainHook : IXposedHookLoadPackage {
             }
         } catch (_: Exception) {}
 
-        // 5. Allow voice assistant (小爱同学) during lock task
+        // 5. Voice assistant control (小爱同学) during lock task
         // Hook LockTaskController to allow assistant packages
         try {
             val ltcClass = XposedHelpers.findClass(
@@ -534,9 +544,9 @@ class MainHook : IXposedHookLoadPackage {
                     authToken = null
                     log("auth timeout, reset")
                 }
-                h.postDelayed(this, 60_000)
+                h.postDelayed(this, AUTH_TIMEOUT_MS)
             }
-        }, 60_000)
+        }, AUTH_TIMEOUT_MS)
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -561,8 +571,8 @@ class MainHook : IXposedHookLoadPackage {
                     // FLAG_SECURE for screenshot blocking during pin
                     updateFlagSecure(activity)
 
-                    if (XposedHelpers.getAdditionalInstanceField(activity, "pg") != null) return
-                    XposedHelpers.setAdditionalInstanceField(activity, "pg", true)
+                    if (XposedHelpers.getAdditionalInstanceField(activity, FIELD_PG) != null) return
+                    XposedHelpers.setAdditionalInstanceField(activity, FIELD_PG, true)
 
                     val receiver = object : BroadcastReceiver() {
                         override fun onReceive(ctx: Context, intent: Intent) {
@@ -572,7 +582,7 @@ class MainHook : IXposedHookLoadPackage {
                             showAuth(act)
                         }
                     }
-                    XposedHelpers.setAdditionalInstanceField(activity, "pg_r", receiver)
+                    XposedHelpers.setAdditionalInstanceField(activity, FIELD_PG_RECEIVER, receiver)
                     activity.registerReceiver(
                         receiver, IntentFilter(ACTION_SHOW_AUTH), Context.RECEIVER_EXPORTED)
                 }
@@ -585,7 +595,7 @@ class MainHook : IXposedHookLoadPackage {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     if (param.args[0] as Int != REQ) return
                     val activity = param.thisObject as Activity
-                    val tag = "pg_handled"
+                    val tag = FIELD_PG_HANDLED
                     if (XposedHelpers.getAdditionalInstanceField(activity, tag) != null) {
                         XposedHelpers.removeAdditionalInstanceField(activity, tag)
                         return
@@ -616,7 +626,7 @@ class MainHook : IXposedHookLoadPackage {
             "onDestroy", object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val r = XposedHelpers.getAdditionalInstanceField(
-                        param.thisObject, "pg_r") as? BroadcastReceiver ?: return
+                        param.thisObject, FIELD_PG_RECEIVER) as? BroadcastReceiver ?: return
                     try { (param.thisObject as Activity).unregisterReceiver(r) }
                     catch (_: Exception) {}
                 }
@@ -650,7 +660,7 @@ class MainHook : IXposedHookLoadPackage {
         try {
             // Set suppress BEFORE clearing tasks (performStopLockTask is async)
             if (isBypassLockscreen()) {
-                suppressKeyguardUntil.set(System.currentTimeMillis() + 5000)
+                suppressKeyguardUntil.set(System.currentTimeMillis() + KEYGUARD_SUPPRESS_MS)
             }
 
             val globalLock = XposedHelpers.getObjectField(atmsRef, "mGlobalLock")

@@ -158,7 +158,7 @@ fun SettingsScreen(
     var isEnabled by remember { mutableStateOf(enabled) }
     var isBypassLockscreen by remember { mutableStateOf(bypassLockscreen) }
     var isBlockScreenshot by remember { mutableStateOf(blockScreenshot) }
-    var isAllowAssistant by remember { mutableStateOf(blockAssistant) }
+    var isBlockAssistant by remember { mutableStateOf(blockAssistant) }
     var isHideExitToast by remember { mutableStateOf(hideExitToast) }
     var isDebugLog by remember { mutableStateOf(debugLog) }
 
@@ -243,8 +243,8 @@ fun SettingsScreen(
 
             Spacer(Modifier.height(12.dp))
 
-            ToggleCard("禁用小白条召唤语音助手", "应用固定期间禁止通过小白条唤醒小爱同学（仅限小爱同学测试）", isAllowAssistant) {
-                isAllowAssistant = it; onAllowAssistantChange(it)
+            ToggleCard("禁用小白条召唤语音助手", "应用固定期间禁止通过小白条唤醒小爱同学（仅限小爱同学测试）", isBlockAssistant) {
+                isBlockAssistant = it; onAllowAssistantChange(it)
             }
 
             Spacer(Modifier.height(12.dp))
