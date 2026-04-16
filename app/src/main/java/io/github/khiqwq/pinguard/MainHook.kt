@@ -46,6 +46,7 @@ class MainHook : IXposedHookLoadPackage {
         const val MODULE_VERSION = 5 // MUST match versionCode in build.gradle.kts
         const val SETTINGS_SUPPRESS_KEY = "pg_suppress_reshow_until"
         const val SETTINGS_SYSUI_READY_KEY = "pg_systemui_hooked"
+        const val SETTINGS_PREFS_SAVED_KEY = "pg_prefs_saved"
         const val ACTION_PING_SYSUI = "io.github.khiqwq.pinguard.PING_SYSUI"
         const val ACTION_SYNC_SETTINGS = "io.github.khiqwq.pinguard.SYNC_SETTINGS"
     }
@@ -79,10 +80,12 @@ class MainHook : IXposedHookLoadPackage {
     // ── prefs ───────────────────────────────────────────────────────
 
     // In-memory cached settings, kept in sync via ACTION_SYNC_SETTINGS broadcast
-    // from MainActivity. XSharedPreferences is unreliable on HyperOS (returns
-    // defaults even when the file exists and is world-readable), so we cache
-    // in memory instead. XSharedPreferences is only used as a fallback for
-    // initial boot before MainActivity has ever been opened.
+    // from MainActivity. XSharedPreferences returns empty in system_server on
+    // HyperOS, so we:
+    //   1. Read from Settings.Global on boot (persisted there by system_server
+    //      whenever SYNC_SETTINGS is received from MainActivity).
+    //   2. Fall back to XSharedPreferences only if Settings.Global has no
+    //      values (e.g., very first boot after install).
     @Volatile private var cachedEnabled = true
     @Volatile private var cachedBypass = true
     @Volatile private var cachedBlockScreenshot = false
@@ -90,20 +93,56 @@ class MainHook : IXposedHookLoadPackage {
     @Volatile private var cachedHideExitToast = false
     @Volatile private var cachedDebugLog = false
 
-    private fun loadInitialPrefs() {
-        try {
-            val p = XSharedPreferences("io.github.khiqwq.pinguard", "config")
-            p.reload()
-            if (p.all.isNotEmpty()) {
-                cachedEnabled = p.getBoolean("enabled", true)
-                cachedBypass = p.getBoolean("bypass_lockscreen", true)
-                cachedBlockScreenshot = p.getBoolean("block_screenshot", false)
-                cachedBlockAssistant = p.getBoolean("block_assistant", false)
-                cachedHideExitToast = p.getBoolean("hide_exit_toast", false)
-                cachedDebugLog = p.getBoolean("debug_log", false)
+    private fun loadInitialPrefs(ctx: Context) {
+        // Try Settings.Global first — this is what SYNC_SETTINGS persists.
+        val cr = ctx.contentResolver
+        val globalLoaded = try {
+            val marker = Settings.Global.getInt(cr, SETTINGS_PREFS_SAVED_KEY, 0)
+            if (marker == 1) {
+                cachedEnabled = Settings.Global.getInt(cr, "pg_enabled", 1) == 1
+                cachedBypass = Settings.Global.getInt(cr, "pg_bypass_lockscreen", 1) == 1
+                cachedBlockScreenshot = Settings.Global.getInt(cr, "pg_block_screenshot", 0) == 1
+                cachedBlockAssistant = Settings.Global.getInt(cr, "pg_block_assistant", 0) == 1
+                cachedHideExitToast = Settings.Global.getInt(cr, "pg_hide_exit_toast", 0) == 1
+                cachedDebugLog = Settings.Global.getInt(cr, "pg_debug_log", 0) == 1
                 debugLog = cachedDebugLog
-            }
-        } catch (_: Exception) {}
+                logAlways("loaded prefs from Settings.Global: blockSs=$cachedBlockScreenshot bypass=$cachedBypass enabled=$cachedEnabled")
+                true
+            } else false
+        } catch (_: Exception) { false }
+
+        if (!globalLoaded) {
+            // Best-effort fallback — XSharedPreferences may or may not return
+            // real values on HyperOS. Wait for MainActivity to broadcast
+            // SYNC_SETTINGS (on user opening the app) for authoritative values.
+            try {
+                val p = XSharedPreferences("io.github.khiqwq.pinguard", "config")
+                p.reload()
+                if (p.all.isNotEmpty()) {
+                    cachedEnabled = p.getBoolean("enabled", true)
+                    cachedBypass = p.getBoolean("bypass_lockscreen", true)
+                    cachedBlockScreenshot = p.getBoolean("block_screenshot", false)
+                    cachedBlockAssistant = p.getBoolean("block_assistant", false)
+                    cachedHideExitToast = p.getBoolean("hide_exit_toast", false)
+                    cachedDebugLog = p.getBoolean("debug_log", false)
+                    debugLog = cachedDebugLog
+                    logAlways("loaded prefs from XSharedPreferences")
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun persistToSettings(ctx: Context) {
+        try {
+            val cr = ctx.contentResolver
+            Settings.Global.putInt(cr, "pg_enabled", if (cachedEnabled) 1 else 0)
+            Settings.Global.putInt(cr, "pg_bypass_lockscreen", if (cachedBypass) 1 else 0)
+            Settings.Global.putInt(cr, "pg_block_screenshot", if (cachedBlockScreenshot) 1 else 0)
+            Settings.Global.putInt(cr, "pg_block_assistant", if (cachedBlockAssistant) 1 else 0)
+            Settings.Global.putInt(cr, "pg_hide_exit_toast", if (cachedHideExitToast) 1 else 0)
+            Settings.Global.putInt(cr, "pg_debug_log", if (cachedDebugLog) 1 else 0)
+            Settings.Global.putInt(cr, SETTINGS_PREFS_SAVED_KEY, 1)
+        } catch (e: Exception) { log("persistToSettings fail: ${e.message}") }
     }
 
     private fun isEnabled(): Boolean = cachedEnabled
@@ -689,10 +728,12 @@ class MainHook : IXposedHookLoadPackage {
 
     private fun registerReceivers(ctx: Context) {
         val h = handler ?: return
-        loadInitialPrefs()
+        loadInitialPrefs(ctx)
 
         // Settings sync — MainActivity broadcasts on startup and on every toggle.
-        // Replaces XSharedPreferences (unreliable on HyperOS).
+        // Replaces XSharedPreferences (unreliable on HyperOS). Also persists to
+        // Settings.Global so the values survive reboot without the user having
+        // to reopen the app.
         //
         // NOTE on security: we can't reliably verify the sender UID inside a
         // handler-dispatched BroadcastReceiver (Binder identity is lost by the
@@ -702,6 +743,7 @@ class MainHook : IXposedHookLoadPackage {
         // opens PinGuard. Full fix requires a signature-level custom permission.
         ctx.registerReceiver(object : BroadcastReceiver() {
             override fun onReceive(c: Context, i: Intent) {
+                val prev = cachedBlockScreenshot
                 cachedEnabled = i.getBooleanExtra("enabled", cachedEnabled)
                 cachedBypass = i.getBooleanExtra("bypass_lockscreen", cachedBypass)
                 cachedBlockScreenshot = i.getBooleanExtra("block_screenshot", cachedBlockScreenshot)
@@ -709,7 +751,8 @@ class MainHook : IXposedHookLoadPackage {
                 cachedHideExitToast = i.getBooleanExtra("hide_exit_toast", cachedHideExitToast)
                 cachedDebugLog = i.getBooleanExtra("debug_log", cachedDebugLog)
                 debugLog = cachedDebugLog
-                log("settings synced: enabled=$cachedEnabled bypass=$cachedBypass blockSs=$cachedBlockScreenshot blockAsst=$cachedBlockAssistant hide=$cachedHideExitToast dbg=$cachedDebugLog")
+                persistToSettings(c)
+                logAlways("SYNC_SETTINGS rcvd: blockSs $prev→$cachedBlockScreenshot bypass=$cachedBypass enabled=$cachedEnabled")
             }
         }, IntentFilter(ACTION_SYNC_SETTINGS), null, h, Context.RECEIVER_EXPORTED)
 
