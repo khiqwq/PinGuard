@@ -8,3 +8,5 @@
 /captures
 .externalNativeBuild
 .cxx
+CLAUDE.md
+.kotlin/
