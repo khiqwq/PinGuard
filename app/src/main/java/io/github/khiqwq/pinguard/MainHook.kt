@@ -16,10 +16,9 @@ import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.XSharedPreferences
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.ref.WeakReference
-import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -43,12 +42,14 @@ class MainHook : IXposedHookLoadPackage {
         const val FIELD_PG = "pg"
         const val FIELD_PG_RECEIVER = "pg_r"
         const val FIELD_PG_HANDLED = "pg_handled"
-        const val MODULE_VERSION = 5 // MUST match versionCode in build.gradle.kts
+        const val MODULE_VERSION = 6 // MUST match versionCode in build.gradle.kts
         const val SETTINGS_SUPPRESS_KEY = "pg_suppress_reshow_until"
         const val SETTINGS_SYSUI_READY_KEY = "pg_systemui_hooked"
         const val SETTINGS_PREFS_SAVED_KEY = "pg_prefs_saved"
         const val ACTION_PING_SYSUI = "io.github.khiqwq.pinguard.PING_SYSUI"
         const val ACTION_SYNC_SETTINGS = "io.github.khiqwq.pinguard.SYNC_SETTINGS"
+        // KEYCODE_ASSIST=219, KEYCODE_VOICE_ASSIST=231, KEYCODE_SEARCH=84
+        private val ASSISTANT_KEYCODES = intArrayOf(219, 231, 84)
     }
 
     // ── state ───────────────────────────────────────────────────────
@@ -60,8 +61,8 @@ class MainHook : IXposedHookLoadPackage {
     @Volatile private var hookedMethodName: String? = null
     @Volatile private var handler: Handler? = null
     private var currentActivity: WeakReference<Activity>? = null
-    private val protectedPackages: MutableSet<String> =
-        Collections.synchronizedSet(HashSet())
+    // ConcurrentHashMap.newKeySet — lock-free reads on hot path
+    private val protectedPackages: MutableSet<String> = ConcurrentHashMap.newKeySet()
     @Volatile private var debugLog = false
 
     @Volatile private var authToken: String? = null
@@ -79,13 +80,13 @@ class MainHook : IXposedHookLoadPackage {
 
     // ── prefs ───────────────────────────────────────────────────────
 
-    // In-memory cached settings, kept in sync via ACTION_SYNC_SETTINGS broadcast
-    // from MainActivity. XSharedPreferences returns empty in system_server on
-    // HyperOS, so we:
-    //   1. Read from Settings.Global on boot (persisted there by system_server
-    //      whenever SYNC_SETTINGS is received from MainActivity).
-    //   2. Fall back to XSharedPreferences only if Settings.Global has no
-    //      values (e.g., very first boot after install).
+    // In-memory cached settings, kept in sync via ACTION_SYNC_SETTINGS
+    // broadcast from MainActivity. XSharedPreferences returns empty in
+    // system_server on HyperOS, so at boot we:
+    //   1. Read from Settings.Global (populated by persistToSettings on every
+    //      SYNC_SETTINGS receive).
+    //   2. On first boot where marker is absent, parse the shared_prefs XML
+    //      file directly — world-readable via fixPerms in MainActivity.
     @Volatile private var cachedEnabled = true
     @Volatile private var cachedBypass = true
     @Volatile private var cachedBlockScreenshot = false
@@ -112,23 +113,41 @@ class MainHook : IXposedHookLoadPackage {
         } catch (_: Exception) { false }
 
         if (!globalLoaded) {
-            // Best-effort fallback — XSharedPreferences may or may not return
-            // real values on HyperOS. Wait for MainActivity to broadcast
-            // SYNC_SETTINGS (on user opening the app) for authoritative values.
-            try {
-                val p = XSharedPreferences("io.github.khiqwq.pinguard", "config")
-                p.reload()
-                if (p.all.isNotEmpty()) {
-                    cachedEnabled = p.getBoolean("enabled", true)
-                    cachedBypass = p.getBoolean("bypass_lockscreen", true)
-                    cachedBlockScreenshot = p.getBoolean("block_screenshot", false)
-                    cachedBlockAssistant = p.getBoolean("block_assistant", false)
-                    cachedHideExitToast = p.getBoolean("hide_exit_toast", false)
-                    cachedDebugLog = p.getBoolean("debug_log", false)
-                    debugLog = cachedDebugLog
-                    logAlways("loaded prefs from XSharedPreferences")
+            // Try direct XML file read — XSharedPreferences silently returns
+            // empty on HyperOS, but system_server can read the world-readable
+            // XML file directly (chmod'd by fixPerms in MainActivity).
+            if (loadPrefsFromFile()) {
+                persistToSettings(ctx) // snapshot into Settings.Global for next boot
+            }
+        }
+    }
+
+    private fun loadPrefsFromFile(): Boolean {
+        return try {
+            val f = java.io.File(
+                "/data/data/io.github.khiqwq.pinguard/shared_prefs/config.xml")
+            if (!f.exists() || !f.canRead()) return false
+            val xml = f.readText()
+            val re = Regex("""<boolean name="([^"]+)" value="(true|false)"""")
+            var matched = false
+            for (m in re.findAll(xml)) {
+                matched = true
+                val key = m.groupValues[1]
+                val value = m.groupValues[2] == "true"
+                when (key) {
+                    "enabled" -> cachedEnabled = value
+                    "bypass_lockscreen" -> cachedBypass = value
+                    "block_screenshot" -> cachedBlockScreenshot = value
+                    "block_assistant" -> cachedBlockAssistant = value
+                    "hide_exit_toast" -> cachedHideExitToast = value
+                    "debug_log" -> { cachedDebugLog = value; debugLog = value }
                 }
-            } catch (_: Exception) {}
+            }
+            if (matched) logAlways(
+                "loaded prefs from XML file: blockSs=$cachedBlockScreenshot bypass=$cachedBypass enabled=$cachedEnabled")
+            matched
+        } catch (e: Exception) {
+            log("loadPrefsFromFile fail: ${e.message}"); false
         }
     }
 
@@ -226,12 +245,12 @@ class MainHook : IXposedHookLoadPackage {
                         try {
                             XposedHelpers.setBooleanField(
                                 param.thisObject, "mNeedToReshowWhenReenabled", false)
-                            logAlways("KVM: cleared reshow flag in ${param.method.name}")
+                            log("KVM: cleared reshow flag in ${param.method.name}")
                         } catch (_: Exception) {}
                         return
                     }
                     param.setResult(null)
-                    logAlways("KVM: skipped ${param.method.name}")
+                    log("KVM: skipped ${param.method.name}")
                 } catch (e: Throwable) {
                     logAlways("KVM hook fault in ${param.method.name}: ${e.message}")
                 }
@@ -417,7 +436,7 @@ class MainHook : IXposedHookLoadPackage {
                         if (!isBypassLockscreen()) return
                         if (System.currentTimeMillis() < suppressKeyguardUntil.get()) {
                             param.setResult(false)
-                            logAlways("shouldLockKeyguard → false")
+                            log("shouldLockKeyguard → false")
                         }
                     }
                 })
@@ -440,7 +459,7 @@ class MainHook : IXposedHookLoadPackage {
                 })
         } catch (_: Exception) {}
 
-        // 4. Screenshot blocking — defeats HyperCeiler "allow FLAG_SECURE" bypass.
+        // 5. Screenshot blocking — defeats HyperCeiler "allow FLAG_SECURE" bypass.
         //
         // HyperCeiler (system-framework scope) hooks:
         //   WindowState.isSecureLocked          → returns false (beforeHook replace)
@@ -455,38 +474,10 @@ class MainHook : IXposedHookLoadPackage {
         //       → runs LAST in before chain, resets mCaptureSecureLayers=false
         //       after HyperCeiler set it to true
         //   (C) HIGHEST-priority beforeHook on WindowManagerService.captureDisplay
-        //       → earliest choke point, block outright when pin+protected+block_screenshot
-        //   (D) Existing entry-point hooks on PWM/DisplayPolicy/ScreenshotHelper
-        //       (harmless fallback on non-HyperCeiler systems)
+        //       → earliest choke point, block outright
 
         val PRIO_HIGH = 10000   // after chain: runs LAST; before chain: runs FIRST
         val PRIO_LOW = -10000   // after chain: runs FIRST; before chain: runs LAST
-
-        // (D) Entry-point block — harmless on HyperOS (methods may not exist)
-        val screenshotEntryBlock = object : XC_MethodHook(PRIO_HIGH) {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                try {
-                    if (isBlockScreenshot() && isInLockTaskWithProtectedApp()) {
-                        log("blocked screenshot entry: ${param.method.name}")
-                        param.setResult(null)
-                    }
-                } catch (e: Throwable) { log("entry-block fault: ${e.message}") }
-            }
-        }
-        for (cls in listOf(
-            "com.android.server.policy.PhoneWindowManager" to listOf("handleScreenShot", "interceptScreenshotChord"),
-            "com.android.server.wm.DisplayPolicy" to listOf("takeScreenshot"),
-            "com.android.internal.util.ScreenshotHelper" to listOf("takeScreenshot")
-        )) {
-            try {
-                val clazz = XposedHelpers.findClass(cls.first, lpparam.classLoader)
-                for (method in clazz.declaredMethods) {
-                    if (method.name in cls.second) {
-                        XposedBridge.hookMethod(method, screenshotEntryBlock)
-                    }
-                }
-            } catch (_: Throwable) {}
-        }
 
         // (A) WindowState.isSecureLocked — override HyperCeiler's false
         try {
@@ -545,7 +536,7 @@ class MainHook : IXposedHookLoadPackage {
                                 try {
                                     if (isBlockScreenshot() && isInLockTaskWithProtectedApp()) {
                                         param.setResult(null)
-                                        logAlways("blocked ${param.method.declaringClass.simpleName}.captureDisplay")
+                                        log("blocked ${param.method.declaringClass.simpleName}.captureDisplay")
                                     }
                                 } catch (e: Throwable) { log("captureDisplay fault: ${e.message}") }
                             }
@@ -626,17 +617,25 @@ class MainHook : IXposedHookLoadPackage {
                     if (method.name == "interceptKeyBeforeDispatching") {
                         XposedBridge.hookMethod(method, object : XC_MethodHook() {
                             override fun beforeHookedMethod(param: MethodHookParam) {
+                                // Fast-path: check keyCode FIRST (cheap) before any
+                                // reflection-heavy isInLockTaskWithProtectedApp check.
+                                var event: android.view.KeyEvent? = null
+                                for (a in param.args) {
+                                    if (a is android.view.KeyEvent) { event = a; break }
+                                }
+                                val kc = event?.keyCode ?: return
+                                var matched = false
+                                for (code in ASSISTANT_KEYCODES) {
+                                    if (code == kc) { matched = true; break }
+                                }
+                                if (!matched) return
                                 if (!isInLockTaskWithProtectedApp()) return
-                                val event = param.args.filterIsInstance<android.view.KeyEvent>().firstOrNull() ?: return
-                                // KEYCODE_ASSIST=219, KEYCODE_VOICE_ASSIST=231, KEYCODE_SEARCH=84
-                                if (event.keyCode in listOf(219, 231, 84)) {
-                                    if (isBlockAssistant()) {
-                                        log("blocked assistant key ${event.keyCode}")
-                                        param.setResult(-1L) // consume = block
-                                    } else {
-                                        log("allowed assistant key ${event.keyCode}")
-                                        param.setResult(0L) // don't consume = allow
-                                    }
+                                if (isBlockAssistant()) {
+                                    log("blocked assistant key $kc")
+                                    param.setResult(-1L) // consume = block
+                                } else {
+                                    log("allowed assistant key $kc")
+                                    param.setResult(0L) // don't consume = allow
                                 }
                             }
                         })
@@ -692,36 +691,80 @@ class MainHook : IXposedHookLoadPackage {
 
     // ── lock task state check ───────────────────────────────────────
 
+    // Cached reflection Fields — populated lazily on first access. ~5-10x
+    // faster than XposedHelpers.getObjectField (which does synchronized
+    // HashMap lookups on every call).
+    @Volatile private var fldLockTaskController: java.lang.reflect.Field? = null
+    @Volatile private var fldLockTaskModeState: java.lang.reflect.Field? = null
+    @Volatile private var fldLockTaskModeTasks: java.lang.reflect.Field? = null
+    @Volatile private var fldTaskRealActivity: java.lang.reflect.Field? = null
+    @Volatile private var fldTaskIntent: java.lang.reflect.Field? = null
+
+    private fun resolveField(cls: Class<*>, name: String): java.lang.reflect.Field? {
+        return try {
+            var c: Class<*>? = cls
+            while (c != null) {
+                try {
+                    val f = c.getDeclaredField(name)
+                    f.isAccessible = true
+                    return f
+                } catch (_: NoSuchFieldException) { c = c.superclass }
+            }
+            null
+        } catch (_: Exception) { null }
+    }
+
     private fun isInLockTaskWithProtectedApp(): Boolean {
         val atms = atmsRef ?: return false
         return try {
-            val ltc = XposedHelpers.getObjectField(atms, "mLockTaskController")
-            val state = XposedHelpers.getIntField(ltc, "mLockTaskModeState")
-            if (state == 0) return false
-            val pkg = getPinnedAppPackage(atms)
-            pkg != null && pkg in protectedPackages
-        } catch (_: Exception) { false }
+            val ltcField = fldLockTaskController
+                ?: resolveField(atms.javaClass, "mLockTaskController")?.also { fldLockTaskController = it }
+                ?: return false
+            val ltc = ltcField.get(atms) ?: return false
+            val stateField = fldLockTaskModeState
+                ?: resolveField(ltc.javaClass, "mLockTaskModeState")?.also { fldLockTaskModeState = it }
+                ?: return false
+            if (stateField.getInt(ltc) == 0) return false
+            val pkg = getPinnedAppPackageFast(ltc) ?: return false
+            pkg in protectedPackages
+        } catch (_: Throwable) { false }
     }
 
     // ── protected package tracking ──────────────────────────────────
 
     @Suppress("UNCHECKED_CAST")
+    private fun getPinnedAppPackageFast(ltc: Any): String? {
+        return try {
+            val tasksField = fldLockTaskModeTasks
+                ?: resolveField(ltc.javaClass, "mLockTaskModeTasks")?.also { fldLockTaskModeTasks = it }
+                ?: return null
+            val tasks = tasksField.get(ltc) as? ArrayList<Any>
+            if (tasks.isNullOrEmpty()) null else getTaskPackage(tasks.last())
+        } catch (_: Throwable) { null }
+    }
+
+    @Suppress("UNCHECKED_CAST")
     private fun getPinnedAppPackage(atms: Any): String? {
         return try {
             val ltc = XposedHelpers.getObjectField(atms, "mLockTaskController")
-            val tasks = XposedHelpers.getObjectField(ltc, "mLockTaskModeTasks") as? ArrayList<Any>
-            if (tasks.isNullOrEmpty()) null else getTaskPackage(tasks.last())
+            getPinnedAppPackageFast(ltc)
         } catch (_: Exception) { null }
     }
 
     private fun getTaskPackage(task: Any): String? {
+        try {
+            val raField = fldTaskRealActivity
+                ?: resolveField(task.javaClass, "realActivity")?.also { fldTaskRealActivity = it }
+            if (raField != null) {
+                val comp = raField.get(task) as? ComponentName
+                if (comp != null) return comp.packageName
+            }
+        } catch (_: Throwable) {}
         return try {
-            (XposedHelpers.getObjectField(task, "realActivity") as? ComponentName)?.packageName
-        } catch (_: Exception) {
-            try {
-                (XposedHelpers.getObjectField(task, "intent") as? Intent)?.component?.packageName
-            } catch (_: Exception) { null }
-        }
+            val iField = fldTaskIntent
+                ?: resolveField(task.javaClass, "intent")?.also { fldTaskIntent = it }
+            (iField?.get(task) as? Intent)?.component?.packageName
+        } catch (_: Throwable) { null }
     }
 
     // ── broadcast receivers (system_server) ─────────────────────────
