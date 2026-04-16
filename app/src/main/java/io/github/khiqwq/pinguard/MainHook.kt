@@ -85,8 +85,8 @@ class MainHook : IXposedHookLoadPackage {
     private fun isBlockScreenshot(): Boolean =
         loadPrefs()?.getBoolean("block_screenshot", false) ?: false
 
-    private fun isAllowAssistant(): Boolean =
-        loadPrefs()?.getBoolean("allow_assistant", false) ?: false
+    private fun isBlockAssistant(): Boolean =
+        loadPrefs()?.getBoolean("block_assistant", false) ?: false
 
     // ── entry ───────────────────────────────────────────────────────
 
@@ -244,41 +244,21 @@ class MainHook : IXposedHookLoadPackage {
         }
 
         // 5. Allow voice assistant (小爱同学) during lock task
+        // Hook LockTaskController to allow assistant packages
         try {
-            val pwmClass = XposedHelpers.findClass(
-                "com.android.server.policy.PhoneWindowManager", lpparam.classLoader)
-
-            // Hook interceptKeyBeforeDispatching to allow assistant key through
-            for (method in pwmClass.declaredMethods) {
-                if (method.name == "interceptKeyBeforeDispatching") {
-                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (!isAllowAssistant() || !isInLockTaskWithProtectedApp()) return
-                            val event = param.args.firstOrNull { it is android.view.KeyEvent } as? android.view.KeyEvent ?: return
-                            // KEYCODE_ASSIST=219, KEYCODE_VOICE_ASSIST=231
-                            if (event.keyCode == 219 || event.keyCode == 231) {
-                                log("allowing assistant key through lock task")
-                                // Don't block — let it pass to the system
-                            }
-                        }
-                    })
-                }
-            }
-
-            // Hook LockTaskController to allow assistant intent
             val ltcClass = XposedHelpers.findClass(
                 "com.android.server.wm.LockTaskController", lpparam.classLoader)
             for (method in ltcClass.declaredMethods) {
                 if (method.name == "isPackageAllowlisted") {
                     XposedBridge.hookMethod(method, object : XC_MethodHook() {
                         override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (!isAllowAssistant()) return
-                            val userId = try { param.args.last() as Int } catch (_: Exception) { return }
-                            val pkg = try { param.args.first() as String } catch (_: Exception) { return }
-                            // Allow Xiaomi voice assistant packages
-                            if (pkg.contains("voiceassist") || pkg.contains("mibrain") ||
-                                pkg.contains("aiasst") || pkg == "com.miui.voiceassist") {
-                                log("allowing assistant package: $pkg")
+                            val pkg = try { param.args.first() as? String } catch (_: Exception) { null } ?: return
+                            if (!isXiaoAiPackage(pkg)) return
+                            if (isBlockAssistant()) {
+                                log("blocked assistant pkg: $pkg")
+                                param.setResult(false)
+                            } else {
+                                log("allowed assistant pkg: $pkg")
                                 param.setResult(true)
                             }
                         }
@@ -286,10 +266,83 @@ class MainHook : IXposedHookLoadPackage {
                     logAlways("hooked isPackageAllowlisted ✓")
                 }
             }
-        } catch (e: Exception) {
-            log("assistant hook fail: ${e.message}")
+        } catch (e: Exception) { log("allowlist hook: ${e.message}") }
+
+        // Hook MiuiPhoneWindowManager/BaseMiuiPhoneWindowManager for HyperOS
+        val miuiPwmNames = listOf(
+            "com.android.server.policy.MiuiPhoneWindowManager",
+            "com.android.server.policy.BaseMiuiPhoneWindowManager"
+        )
+        for (clsName in miuiPwmNames) {
+            try {
+                val cls = XposedHelpers.findClass(clsName, lpparam.classLoader)
+                for (method in cls.declaredMethods) {
+                    if (method.name == "interceptKeyBeforeDispatching") {
+                        XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                            override fun beforeHookedMethod(param: MethodHookParam) {
+                                if (!isInLockTaskWithProtectedApp()) return
+                                val event = param.args.filterIsInstance<android.view.KeyEvent>().firstOrNull() ?: return
+                                // KEYCODE_ASSIST=219, KEYCODE_VOICE_ASSIST=231, KEYCODE_SEARCH=84
+                                if (event.keyCode in listOf(219, 231, 84)) {
+                                    if (isBlockAssistant()) {
+                                        log("blocked assistant key ${event.keyCode}")
+                                        param.setResult(-1L) // consume = block
+                                    } else {
+                                        log("allowed assistant key ${event.keyCode}")
+                                        param.setResult(0L) // don't consume = allow
+                                    }
+                                }
+                            }
+                        })
+                        logAlways("hooked $clsName.interceptKeyBeforeDispatching ✓")
+                    }
+                    // Hook launchAssistAction if it exists
+                    if (method.name == "launchAssistAction") {
+                        XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                            override fun beforeHookedMethod(param: MethodHookParam) {
+                                if (!isInLockTaskWithProtectedApp()) return
+                                if (isBlockAssistant()) {
+                                    log("blocked launchAssistAction")
+                                    param.setResult(null)
+                                } else {
+                                    log("allowed launchAssistAction")
+                                }
+                            }
+                        })
+                    }
+                }
+            } catch (_: Exception) {} // Class may not exist on non-MIUI
         }
+
+        // Hook ShortCutActionsUtils.triggerFunction for 小白条 double-tap
+        try {
+            val scaClass = XposedHelpers.findClass(
+                "com.miui.server.input.util.ShortCutActionsUtils", lpparam.classLoader)
+            for (method in scaClass.declaredMethods) {
+                if (method.name == "triggerFunction") {
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            if (!isInLockTaskWithProtectedApp()) return
+                            val func = param.args.firstOrNull() as? String ?: return
+                            if (func == "launch_voice_assistant" || func == "launch_ai_shortcut") {
+                                if (isBlockAssistant()) {
+                                    log("blocked $func")
+                                    param.setResult(null)
+                                } else {
+                                    log("allowed $func")
+                                }
+                            }
+                        }
+                    })
+                    logAlways("hooked ShortCutActionsUtils.triggerFunction ✓")
+                }
+            }
+        } catch (_: Exception) {} // Non-MIUI devices won't have this
     }
+
+    private fun isXiaoAiPackage(pkg: String): Boolean =
+        pkg == "com.miui.voiceassist" || pkg == "com.xiaomi.voiceassistant" ||
+        pkg.contains("mibrain") || pkg.contains("aiasst") || pkg.contains("voiceassist")
 
     // ── lock task state check ───────────────────────────────────────
 

@@ -86,13 +86,13 @@ class MainActivity : ComponentActivity() {
                     enabled = prefs.getBoolean("enabled", true),
                     bypassLockscreen = prefs.getBoolean("bypass_lockscreen", true),
                     blockScreenshot = prefs.getBoolean("block_screenshot", false),
-                    allowAssistant = prefs.getBoolean("allow_assistant", false),
+                    blockAssistant = prefs.getBoolean("block_assistant", false),
                     hideExitToast = prefs.getBoolean("hide_exit_toast", false),
                     debugLog = prefs.getBoolean("debug_log", false),
                     onEnabledChange = { prefs.edit().putBoolean("enabled", it).commit(); fixPerms() },
                     onBypassLockscreenChange = { prefs.edit().putBoolean("bypass_lockscreen", it).commit(); fixPerms() },
                     onBlockScreenshotChange = { prefs.edit().putBoolean("block_screenshot", it).commit(); fixPerms() },
-                    onAllowAssistantChange = { prefs.edit().putBoolean("allow_assistant", it).commit(); fixPerms() },
+                    onAllowAssistantChange = { prefs.edit().putBoolean("block_assistant", it).commit(); fixPerms() },
                     onHideExitToastChange = { prefs.edit().putBoolean("hide_exit_toast", it).commit(); fixPerms() },
                     onDebugLogChange = { prefs.edit().putBoolean("debug_log", it).commit(); fixPerms() }
                 )
@@ -145,7 +145,7 @@ fun SettingsScreen(
     enabled: Boolean,
     bypassLockscreen: Boolean,
     blockScreenshot: Boolean,
-    allowAssistant: Boolean,
+    blockAssistant: Boolean,
     hideExitToast: Boolean,
     debugLog: Boolean,
     onEnabledChange: (Boolean) -> Unit,
@@ -158,7 +158,7 @@ fun SettingsScreen(
     var isEnabled by remember { mutableStateOf(enabled) }
     var isBypassLockscreen by remember { mutableStateOf(bypassLockscreen) }
     var isBlockScreenshot by remember { mutableStateOf(blockScreenshot) }
-    var isAllowAssistant by remember { mutableStateOf(allowAssistant) }
+    var isAllowAssistant by remember { mutableStateOf(blockAssistant) }
     var isHideExitToast by remember { mutableStateOf(hideExitToast) }
     var isDebugLog by remember { mutableStateOf(debugLog) }
 
@@ -237,7 +237,7 @@ fun SettingsScreen(
 
             Spacer(Modifier.height(12.dp))
 
-            ToggleCard("允许语音助手", "应用固定期间允许小爱同学唤醒（仅限小爱同学测试）", isAllowAssistant) {
+            ToggleCard("禁用语音助手", "应用固定期间禁止小爱同学唤醒（仅限小爱同学测试）", isAllowAssistant) {
                 isAllowAssistant = it; onAllowAssistantChange(it)
             }
 
