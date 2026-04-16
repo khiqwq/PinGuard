@@ -243,6 +243,27 @@ class MainHook : IXposedHookLoadPackage {
             log("screenshot hook fail: ${e.message}")
         }
 
+        // Also hook DisplayPolicy.takeScreenshot — catches ALL paths (3-finger swipe etc.)
+        try {
+            val dpClass = XposedHelpers.findClass(
+                "com.android.server.wm.DisplayPolicy", lpparam.classLoader)
+            for (method in dpClass.declaredMethods) {
+                if (method.name == "takeScreenshot") {
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            if (isBlockScreenshot() && isInLockTaskWithProtectedApp()) {
+                                log("blocked DisplayPolicy.takeScreenshot")
+                                param.setResult(null)
+                            }
+                        }
+                    })
+                    logAlways("hooked DisplayPolicy.takeScreenshot ✓")
+                }
+            }
+        } catch (e: Exception) {
+            log("DisplayPolicy screenshot hook fail: ${e.message}")
+        }
+
         // 5. Allow voice assistant (小爱同学) during lock task
         // Hook LockTaskController to allow assistant packages
         try {
@@ -554,18 +575,22 @@ class MainHook : IXposedHookLoadPackage {
             }
             log("unpin OK")
 
-            // Dismiss keyguard if bypass_lockscreen is on
+            // Go to home screen directly, bypassing any lingering keyguard
             if (isBypassLockscreen()) {
-                try {
-                    val wms = Class.forName("android.view.WindowManagerGlobal")
-                        .getMethod("getWindowManagerService").invoke(null)
-                    wms.javaClass.getMethod(
-                        "dismissKeyguard",
-                        Class.forName("com.android.internal.policy.IKeyguardDismissCallback"),
-                        CharSequence::class.java
-                    ).invoke(wms, null, null)
-                    log("keyguard dismissed")
-                } catch (_: Exception) {}
+                handler?.postDelayed({
+                    try {
+                        val ctx = XposedHelpers.getObjectField(atmsRef, "mContext") as Context
+                        val homeIntent = Intent(Intent.ACTION_MAIN).apply {
+                            addCategory(Intent.CATEGORY_HOME)
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or
+                                Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+                        }
+                        val id = Binder.clearCallingIdentity()
+                        try { ctx.startActivity(homeIntent) }
+                        finally { Binder.restoreCallingIdentity(id) }
+                        log("started home")
+                    } catch (e: Exception) { log("home fail: ${e.message}") }
+                }, 200)
             }
         } catch (e: Exception) {
             logAlways("unpin FAIL: ${e.message}")
