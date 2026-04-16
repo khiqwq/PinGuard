@@ -43,10 +43,11 @@ class MainHook : IXposedHookLoadPackage {
         const val FIELD_PG = "pg"
         const val FIELD_PG_RECEIVER = "pg_r"
         const val FIELD_PG_HANDLED = "pg_handled"
-        const val MODULE_VERSION = 4 // MUST match versionCode in build.gradle.kts
+        const val MODULE_VERSION = 5 // MUST match versionCode in build.gradle.kts
         const val SETTINGS_SUPPRESS_KEY = "pg_suppress_reshow_until"
         const val SETTINGS_SYSUI_READY_KEY = "pg_systemui_hooked"
         const val ACTION_PING_SYSUI = "io.github.khiqwq.pinguard.PING_SYSUI"
+        const val ACTION_SYNC_SETTINGS = "io.github.khiqwq.pinguard.SYNC_SETTINGS"
     }
 
     // ── state ───────────────────────────────────────────────────────
@@ -77,29 +78,39 @@ class MainHook : IXposedHookLoadPackage {
 
     // ── prefs ───────────────────────────────────────────────────────
 
-    private fun loadPrefs(): XSharedPreferences? {
-        return try {
+    // In-memory cached settings, kept in sync via ACTION_SYNC_SETTINGS broadcast
+    // from MainActivity. XSharedPreferences is unreliable on HyperOS (returns
+    // defaults even when the file exists and is world-readable), so we cache
+    // in memory instead. XSharedPreferences is only used as a fallback for
+    // initial boot before MainActivity has ever been opened.
+    @Volatile private var cachedEnabled = true
+    @Volatile private var cachedBypass = true
+    @Volatile private var cachedBlockScreenshot = false
+    @Volatile private var cachedBlockAssistant = false
+    @Volatile private var cachedHideExitToast = false
+    @Volatile private var cachedDebugLog = false
+
+    private fun loadInitialPrefs() {
+        try {
             val p = XSharedPreferences("io.github.khiqwq.pinguard", "config")
             p.reload()
-            debugLog = p.getBoolean("debug_log", false)
-            p
-        } catch (_: Exception) { null }
+            if (p.all.isNotEmpty()) {
+                cachedEnabled = p.getBoolean("enabled", true)
+                cachedBypass = p.getBoolean("bypass_lockscreen", true)
+                cachedBlockScreenshot = p.getBoolean("block_screenshot", false)
+                cachedBlockAssistant = p.getBoolean("block_assistant", false)
+                cachedHideExitToast = p.getBoolean("hide_exit_toast", false)
+                cachedDebugLog = p.getBoolean("debug_log", false)
+                debugLog = cachedDebugLog
+            }
+        } catch (_: Exception) {}
     }
 
-    private fun isEnabled(): Boolean =
-        loadPrefs()?.getBoolean("enabled", true) ?: true
-
-    private fun isHideExitToast(): Boolean =
-        loadPrefs()?.getBoolean("hide_exit_toast", false) ?: false
-
-    private fun isBypassLockscreen(): Boolean =
-        loadPrefs()?.getBoolean("bypass_lockscreen", true) ?: false
-
-    private fun isBlockScreenshot(): Boolean =
-        loadPrefs()?.getBoolean("block_screenshot", false) ?: false
-
-    private fun isBlockAssistant(): Boolean =
-        loadPrefs()?.getBoolean("block_assistant", false) ?: false
+    private fun isEnabled(): Boolean = cachedEnabled
+    private fun isHideExitToast(): Boolean = cachedHideExitToast
+    private fun isBypassLockscreen(): Boolean = cachedBypass
+    private fun isBlockScreenshot(): Boolean = cachedBlockScreenshot
+    private fun isBlockAssistant(): Boolean = cachedBlockAssistant
 
     // ── entry ───────────────────────────────────────────────────────
 
@@ -390,19 +401,37 @@ class MainHook : IXposedHookLoadPackage {
                 })
         } catch (_: Exception) {}
 
-        // 4. Screenshot blocking — multi-layer, HyperCeiler compatible
+        // 4. Screenshot blocking — defeats HyperCeiler "allow FLAG_SECURE" bypass.
         //
-        // Layer 1: Block screenshot initiation (system_server)
-        // Layer 2: Override HyperCeiler's FLAG_SECURE bypass (afterHook wins)
-        // Layer 3: Block HyperOS-specific capture path
+        // HyperCeiler (system-framework scope) hooks:
+        //   WindowState.isSecureLocked          → returns false (beforeHook replace)
+        //   WindowManagerServiceImpl.notAllowCaptureDisplay → returns false
+        //   ScreenCapture.nativeCaptureDisplay  → CaptureArgs.mCaptureSecureLayers = true
+        //   ScreenCapture.nativeCaptureLayers   → same
+        //
+        // Strategy:
+        //   (A) HIGHEST-priority afterHook on isSecureLocked / notAllowCaptureDisplay
+        //       → runs LAST in after chain, wins setResult(true)
+        //   (B) LOWEST-priority beforeHook on ScreenCapture.nativeCaptureDisplay/Layers
+        //       → runs LAST in before chain, resets mCaptureSecureLayers=false
+        //       after HyperCeiler set it to true
+        //   (C) HIGHEST-priority beforeHook on WindowManagerService.captureDisplay
+        //       → earliest choke point, block outright when pin+protected+block_screenshot
+        //   (D) Existing entry-point hooks on PWM/DisplayPolicy/ScreenshotHelper
+        //       (harmless fallback on non-HyperCeiler systems)
 
-        // Layer 1: Block screenshot methods in system_server
-        val screenshotCheck = object : XC_MethodHook() {
+        val PRIO_HIGH = 10000   // after chain: runs LAST; before chain: runs FIRST
+        val PRIO_LOW = -10000   // after chain: runs FIRST; before chain: runs LAST
+
+        // (D) Entry-point block — harmless on HyperOS (methods may not exist)
+        val screenshotEntryBlock = object : XC_MethodHook(PRIO_HIGH) {
             override fun beforeHookedMethod(param: MethodHookParam) {
-                if (isBlockScreenshot() && isInLockTaskWithProtectedApp()) {
-                    log("blocked screenshot: ${param.method.name}")
-                    param.setResult(null)
-                }
+                try {
+                    if (isBlockScreenshot() && isInLockTaskWithProtectedApp()) {
+                        log("blocked screenshot entry: ${param.method.name}")
+                        param.setResult(null)
+                    }
+                } catch (e: Throwable) { log("entry-block fault: ${e.message}") }
             }
         }
         for (cls in listOf(
@@ -414,51 +443,112 @@ class MainHook : IXposedHookLoadPackage {
                 val clazz = XposedHelpers.findClass(cls.first, lpparam.classLoader)
                 for (method in clazz.declaredMethods) {
                     if (method.name in cls.second) {
-                        XposedBridge.hookMethod(method, screenshotCheck)
+                        XposedBridge.hookMethod(method, screenshotEntryBlock)
                     }
                 }
-            } catch (_: Exception) {}
+            } catch (_: Throwable) {}
         }
 
-        // Layer 2: Override HyperCeiler — re-enforce isSecureLocked() = true
-        // HyperCeiler hooks isSecureLocked() to return false (allow screenshot)
-        // We use afterHook to override AFTER HyperCeiler's hook runs
+        // (A) WindowState.isSecureLocked — override HyperCeiler's false
         try {
             val wsClass = XposedHelpers.findClass(
                 "com.android.server.wm.WindowState", lpparam.classLoader)
             for (method in wsClass.declaredMethods) {
                 if (method.name == "isSecureLocked") {
-                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    XposedBridge.hookMethod(method, object : XC_MethodHook(PRIO_HIGH) {
                         override fun afterHookedMethod(param: MethodHookParam) {
-                            if (isBlockScreenshot() && isInLockTaskWithProtectedApp()) {
-                                param.setResult(true)
-                            }
+                            try {
+                                if (isBlockScreenshot() && isInLockTaskWithProtectedApp()) {
+                                    param.setResult(true)
+                                }
+                            } catch (_: Throwable) {}
                         }
                     })
-                    logAlways("hooked WindowState.isSecureLocked (after) ✓")
+                    logAlways("hooked WindowState.isSecureLocked (PRIO_HIGH after) ✓")
                 }
             }
-        } catch (_: Exception) {}
+        } catch (_: Throwable) {}
 
-        // Layer 3: HyperOS-specific — notAllowCaptureDisplay
-        // HyperCeiler hooks this to return false; we override back to true
+        // (A) HyperOS-specific notAllowCaptureDisplay
         try {
             val wmsImpl = XposedHelpers.findClass(
                 "com.android.server.wm.WindowManagerServiceImpl", lpparam.classLoader)
             for (method in wmsImpl.declaredMethods) {
                 if (method.name == "notAllowCaptureDisplay") {
-                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    XposedBridge.hookMethod(method, object : XC_MethodHook(PRIO_HIGH) {
                         override fun afterHookedMethod(param: MethodHookParam) {
-                            if (isBlockScreenshot() && isInLockTaskWithProtectedApp()) {
-                                param.setResult(true)
-                                log("notAllowCaptureDisplay → true")
-                            }
+                            try {
+                                if (isBlockScreenshot() && isInLockTaskWithProtectedApp()) {
+                                    param.setResult(true)
+                                    log("notAllowCaptureDisplay → true")
+                                }
+                            } catch (_: Throwable) {}
                         }
                     })
-                    logAlways("hooked notAllowCaptureDisplay (after) ✓")
+                    logAlways("hooked notAllowCaptureDisplay (PRIO_HIGH after) ✓")
                 }
             }
-        } catch (_: Exception) {}
+        } catch (_: Throwable) {}
+
+        // (C) WindowManagerService.captureDisplay — earliest choke point.
+        // Also hook WindowManagerServiceImpl (HyperOS MIUI wrapper) — it may
+        // override captureDisplay with different dispatch semantics.
+        for (wmsClsName in listOf(
+            "com.android.server.wm.WindowManagerService",
+            "com.android.server.wm.WindowManagerServiceImpl"
+        )) {
+            try {
+                val wmsClass = XposedHelpers.findClass(wmsClsName, lpparam.classLoader)
+                for (method in wmsClass.declaredMethods) {
+                    if (method.name == "captureDisplay") {
+                        XposedBridge.hookMethod(method, object : XC_MethodHook(PRIO_HIGH) {
+                            override fun beforeHookedMethod(param: MethodHookParam) {
+                                try {
+                                    if (isBlockScreenshot() && isInLockTaskWithProtectedApp()) {
+                                        param.setResult(null)
+                                        logAlways("blocked ${param.method.declaringClass.simpleName}.captureDisplay")
+                                    }
+                                } catch (e: Throwable) { log("captureDisplay fault: ${e.message}") }
+                            }
+                        })
+                        logAlways("hooked ${wmsClsName.substringAfterLast('.')}.captureDisplay (PRIO_HIGH before) ✓")
+                    }
+                }
+            } catch (_: Throwable) {}
+        }
+
+        // (B) ScreenCapture native — LOWEST priority beforeHook so our field
+        // write runs AFTER HyperCeiler's. Field writes are sequential; last wins.
+        try {
+            val scClass = XposedHelpers.findClass(
+                "android.window.ScreenCapture", lpparam.classLoader)
+            val scSanitizer = object : XC_MethodHook(PRIO_LOW) {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    try {
+                        if (!isBlockScreenshot() || !isInLockTaskWithProtectedApp()) return
+                        val captureArgs = param.args.firstOrNull() ?: return
+                        try {
+                            XposedHelpers.setBooleanField(
+                                captureArgs, "mCaptureSecureLayers", false)
+                        } catch (_: Exception) {}
+                        try {
+                            XposedHelpers.setIntField(
+                                captureArgs, "mSecureContentPolicy", 0)
+                        } catch (_: Exception) {}
+                        log("ScreenCapture.${param.method.name}: forced secure exclusion")
+                    } catch (e: Throwable) { log("SC hook fault: ${e.message}") }
+                }
+            }
+            for (method in scClass.declaredMethods) {
+                if (method.name in setOf("nativeCaptureDisplay", "nativeCaptureLayers",
+                        "captureDisplay", "captureLayers")) {
+                    try {
+                        XposedBridge.hookMethod(method, scSanitizer)
+                        logAlways("hooked ScreenCapture.${method.name} (PRIO_LOW before) ✓")
+                    } catch (e: Throwable) { log("SC ${method.name} fail: ${e.message}") }
+                }
+            }
+        } catch (_: Throwable) {}
 
         // 5. Voice assistant control (小爱同学) during lock task
         // Hook LockTaskController to allow assistant packages
@@ -599,8 +689,31 @@ class MainHook : IXposedHookLoadPackage {
 
     private fun registerReceivers(ctx: Context) {
         val h = handler ?: return
+        loadInitialPrefs()
 
-        // PING/PONG — respond with targeted PONG + prefs readability status
+        // Settings sync — MainActivity broadcasts on startup and on every toggle.
+        // Replaces XSharedPreferences (unreliable on HyperOS).
+        //
+        // NOTE on security: we can't reliably verify the sender UID inside a
+        // handler-dispatched BroadcastReceiver (Binder identity is lost by the
+        // time onReceive runs on our handler). A malicious app could spoof
+        // SYNC_SETTINGS with enabled=false. Mitigation: MainActivity re-sends
+        // on every Activity resume, so the state resets whenever the user
+        // opens PinGuard. Full fix requires a signature-level custom permission.
+        ctx.registerReceiver(object : BroadcastReceiver() {
+            override fun onReceive(c: Context, i: Intent) {
+                cachedEnabled = i.getBooleanExtra("enabled", cachedEnabled)
+                cachedBypass = i.getBooleanExtra("bypass_lockscreen", cachedBypass)
+                cachedBlockScreenshot = i.getBooleanExtra("block_screenshot", cachedBlockScreenshot)
+                cachedBlockAssistant = i.getBooleanExtra("block_assistant", cachedBlockAssistant)
+                cachedHideExitToast = i.getBooleanExtra("hide_exit_toast", cachedHideExitToast)
+                cachedDebugLog = i.getBooleanExtra("debug_log", cachedDebugLog)
+                debugLog = cachedDebugLog
+                log("settings synced: enabled=$cachedEnabled bypass=$cachedBypass blockSs=$cachedBlockScreenshot blockAsst=$cachedBlockAssistant hide=$cachedHideExitToast dbg=$cachedDebugLog")
+            }
+        }, IntentFilter(ACTION_SYNC_SETTINGS), null, h, Context.RECEIVER_EXPORTED)
+
+        // PING/PONG — respond with targeted PONG (safe: just reports module status)
         ctx.registerReceiver(object : BroadcastReceiver() {
             override fun onReceive(c: Context, i: Intent) {
                 val sender = i.getStringExtra(EXTRA_PKG)
@@ -610,7 +723,11 @@ class MainHook : IXposedHookLoadPackage {
             }
         }, IntentFilter(ACTION_PING), null, h, Context.RECEIVER_EXPORTED)
 
-        // App registration — capped to prevent DoS
+        // App registration — capped to prevent DoS. Cannot reliably verify
+        // sender UID inside handler-dispatched receiver (see SYNC_SETTINGS
+        // note above), so any app can register an arbitrary package. Worst
+        // case: protectedPackages fills with junk up to MAX_PROTECTED; users
+        // can work around by reinstalling or rebooting.
         ctx.registerReceiver(object : BroadcastReceiver() {
             override fun onReceive(c: Context, intent: Intent) {
                 if (protectedPackages.size >= MAX_PROTECTED) return
@@ -652,11 +769,13 @@ class MainHook : IXposedHookLoadPackage {
             }
         }, IntentFilter(ACTION_AUTH_SUCCESS), null, h, Context.RECEIVER_EXPORTED)
 
-        // Auth timeout — reset pending state after 60s
+        // Auth timeout — unconditionally reset pending state every 60s.
+        // Worst case: a legitimate in-progress auth is cancelled at T=60s from
+        // the poll's last fire. Acceptable for the current UX; a per-token
+        // timestamp would be more precise but adds complexity.
         h.postDelayed(object : Runnable {
             override fun run() {
                 if (authPending.get() && authToken != null) {
-                    // Check if token is stale (set > 60s ago)
                     authPending.set(false)
                     authToken = null
                     log("auth timeout, reset")
@@ -790,13 +909,17 @@ class MainHook : IXposedHookLoadPackage {
     // in dimmed brightness — especially after screen off/on events during pin.
     @Suppress("UNCHECKED_CAST")
     private fun manualUnpin() {
+        val atms = atmsRef ?: run {
+            logAlways("manualUnpin: atmsRef null, skipping")
+            return
+        }
         val callingId = Binder.clearCallingIdentity()
         try {
             if (isBypassLockscreen()) {
                 suppressKeyguardUntil.set(System.currentTimeMillis() + KEYGUARD_SUPPRESS_MS)
                 // Signal SystemUI KVM hook to skip reshow during upcoming enableKeyguard(true)
                 try {
-                    val ctx = XposedHelpers.getObjectField(atmsRef, "mContext") as Context
+                    val ctx = XposedHelpers.getObjectField(atms, "mContext") as Context
                     Settings.Global.putLong(ctx.contentResolver, SETTINGS_SUPPRESS_KEY,
                         System.currentTimeMillis() + KEYGUARD_SUPPRESS_MS)
                 } catch (e: Exception) { log("suppress signal fail: ${e.message}") }
@@ -804,18 +927,19 @@ class MainHook : IXposedHookLoadPackage {
             authPassed.set(true)
             try {
                 XposedHelpers.callMethod(
-                    atmsRef, hookedMethodName ?: "stopSystemLockTaskMode")
+                    atms, hookedMethodName ?: "stopSystemLockTaskMode")
                 log("unpin OK via original")
                 return
             } catch (e: Exception) {
                 logAlways("original unpin fail: ${e.message}, fallback to manual clear")
+                authPassed.set(false) // not consumed; prevent leaking to next unpin
             }
 
             // Fallback: manual clear if original call fails. State notifications
             // won't fire, but at least the app exits pin mode.
-            val globalLock = XposedHelpers.getObjectField(atmsRef, "mGlobalLock")
+            val globalLock = XposedHelpers.getObjectField(atms, "mGlobalLock")
             synchronized(globalLock) {
-                val ltc = XposedHelpers.getObjectField(atmsRef, "mLockTaskController")
+                val ltc = XposedHelpers.getObjectField(atms, "mLockTaskController")
                 try {
                     val tasks = XposedHelpers.getObjectField(
                         ltc, "mLockTaskModeTasks") as ArrayList<Any>

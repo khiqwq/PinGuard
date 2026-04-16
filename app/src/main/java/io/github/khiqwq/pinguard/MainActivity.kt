@@ -81,9 +81,8 @@ class MainActivity : ComponentActivity() {
             IntentFilter("io.github.khiqwq.pinguard.PONG"),
             Context.RECEIVER_EXPORTED
         )
-        // Write sentinel for prefs readability check
-        prefs.edit().putBoolean("_sentinel", true).commit()
         fixPerms()
+        syncSettings(prefs)
         sendBroadcast(Intent("io.github.khiqwq.pinguard.PING").putExtra("pkg", packageName))
 
         refreshSystemUIHooked()
@@ -103,12 +102,12 @@ class MainActivity : ComponentActivity() {
                     blockAssistant = prefs.getBoolean("block_assistant", false),
                     hideExitToast = prefs.getBoolean("hide_exit_toast", false),
                     debugLog = prefs.getBoolean("debug_log", false),
-                    onEnabledChange = { prefs.edit().putBoolean("enabled", it).commit(); fixPerms() },
-                    onBypassLockscreenChange = { prefs.edit().putBoolean("bypass_lockscreen", it).commit(); fixPerms() },
-                    onBlockScreenshotChange = { prefs.edit().putBoolean("block_screenshot", it).commit(); fixPerms() },
-                    onAllowAssistantChange = { prefs.edit().putBoolean("block_assistant", it).commit(); fixPerms() },
-                    onHideExitToastChange = { prefs.edit().putBoolean("hide_exit_toast", it).commit(); fixPerms() },
-                    onDebugLogChange = { prefs.edit().putBoolean("debug_log", it).commit(); fixPerms() }
+                    onEnabledChange = { prefs.edit().putBoolean("enabled", it).commit(); fixPerms(); syncSettings(prefs) },
+                    onBypassLockscreenChange = { prefs.edit().putBoolean("bypass_lockscreen", it).commit(); fixPerms(); syncSettings(prefs) },
+                    onBlockScreenshotChange = { prefs.edit().putBoolean("block_screenshot", it).commit(); fixPerms(); syncSettings(prefs) },
+                    onBlockAssistantChange = { prefs.edit().putBoolean("block_assistant", it).commit(); fixPerms(); syncSettings(prefs) },
+                    onHideExitToastChange = { prefs.edit().putBoolean("hide_exit_toast", it).commit(); fixPerms(); syncSettings(prefs) },
+                    onDebugLogChange = { prefs.edit().putBoolean("debug_log", it).commit(); fixPerms(); syncSettings(prefs) }
                 )
             }
         }
@@ -120,6 +119,24 @@ class MainActivity : ComponentActivity() {
             dir.setExecutable(true, false)
             dir.setReadable(true, false)
             File(dir, "config.xml").setReadable(true, false)
+        } catch (_: Exception) {}
+    }
+
+    // Broadcast all settings to system_server (where XSharedPreferences is
+    // unreliable on HyperOS). system_server caches these in memory.
+    private fun syncSettings(prefs: SharedPreferences) {
+        try {
+            // No setPackage — runtime-registered receivers in system_server
+            // don't match package filters. Same pattern as PING / REGISTER_APP.
+            sendBroadcast(
+                Intent("io.github.khiqwq.pinguard.SYNC_SETTINGS")
+                    .putExtra("enabled", prefs.getBoolean("enabled", true))
+                    .putExtra("bypass_lockscreen", prefs.getBoolean("bypass_lockscreen", true))
+                    .putExtra("block_screenshot", prefs.getBoolean("block_screenshot", false))
+                    .putExtra("block_assistant", prefs.getBoolean("block_assistant", false))
+                    .putExtra("hide_exit_toast", prefs.getBoolean("hide_exit_toast", false))
+                    .putExtra("debug_log", prefs.getBoolean("debug_log", false))
+            )
         } catch (_: Exception) {}
     }
 
@@ -185,7 +202,7 @@ fun SettingsScreen(
     onEnabledChange: (Boolean) -> Unit,
     onBypassLockscreenChange: (Boolean) -> Unit,
     onBlockScreenshotChange: (Boolean) -> Unit,
-    onAllowAssistantChange: (Boolean) -> Unit,
+    onBlockAssistantChange: (Boolean) -> Unit,
     onHideExitToastChange: (Boolean) -> Unit,
     onDebugLogChange: (Boolean) -> Unit
 ) {
@@ -283,7 +300,7 @@ fun SettingsScreen(
             Spacer(Modifier.height(12.dp))
 
             ToggleCard("禁用小白条召唤语音助手", "应用固定期间禁止通过小白条唤醒小爱同学（仅限小爱同学测试）", isBlockAssistant) {
-                isBlockAssistant = it; onAllowAssistantChange(it)
+                isBlockAssistant = it; onBlockAssistantChange(it)
             }
 
             Spacer(Modifier.height(12.dp))
