@@ -488,13 +488,6 @@ class MainHook : IXposedHookLoadPackage {
         ctx.registerReceiver(object : BroadcastReceiver() {
             override fun onReceive(c: Context, i: Intent) {
                 val sender = i.getStringExtra(EXTRA_PKG)
-                val prefsOk = try {
-                    val p = XSharedPreferences("io.github.khiqwq.pinguard", "config")
-                    p.reload()
-                    // If getAll() has entries, the file is readable
-                    // If empty but _sentinel was written, file is NOT readable
-                    p.all.isNotEmpty()
-                } catch (_: Exception) { false }
                 val pong = Intent(ACTION_PONG).putExtra("ver", MODULE_VERSION)
                 if (sender != null) pong.setPackage(sender)
                 c.sendBroadcast(pong)
