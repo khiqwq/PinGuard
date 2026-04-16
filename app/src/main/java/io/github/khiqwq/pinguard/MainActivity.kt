@@ -50,24 +50,28 @@ import androidx.compose.ui.unit.sp
 class MainActivity : ComponentActivity() {
 
     private val moduleActive = mutableStateOf(false)
+    private val needsReboot = mutableStateOf(false)
     private var pongReceiver: BroadcastReceiver? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
 
-        var prefsFallback = false
         val prefs = try {
             @Suppress("DEPRECATION")
             getSharedPreferences("config", Context.MODE_WORLD_READABLE)
         } catch (_: SecurityException) {
-            prefsFallback = true
             getSharedPreferences("config", Context.MODE_PRIVATE)
         }
 
+        val appVersion = try {
+            packageManager.getPackageInfo(packageName, 0).longVersionCode.toInt()
+        } catch (_: Exception) { -1 }
         pongReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 moduleActive.value = true
+                val hookVersion = intent.getIntExtra("ver", -1)
+                needsReboot.value = hookVersion != appVersion
             }
         }
         registerReceiver(
@@ -75,14 +79,18 @@ class MainActivity : ComponentActivity() {
             IntentFilter("io.github.khiqwq.pinguard.PONG"),
             Context.RECEIVER_EXPORTED
         )
+        // Write sentinel for prefs readability check
+        prefs.edit().putBoolean("_sentinel", true).commit()
+        fixPerms()
         sendBroadcast(Intent("io.github.khiqwq.pinguard.PING").putExtra("pkg", packageName))
 
         setContent {
             MaterialTheme(colorScheme = lightColorScheme()) {
                 val isActive by moduleActive
+                val reboot by needsReboot
                 SettingsScreen(
                     moduleActive = isActive,
-                    prefsFallback = prefsFallback,
+                    needsReboot = reboot,
                     enabled = prefs.getBoolean("enabled", true),
                     bypassLockscreen = prefs.getBoolean("bypass_lockscreen", true),
                     blockScreenshot = prefs.getBoolean("block_screenshot", false),
@@ -141,7 +149,7 @@ private fun ToggleCard(
 @Composable
 fun SettingsScreen(
     moduleActive: Boolean,
-    prefsFallback: Boolean = false,
+    needsReboot: Boolean = false,
     enabled: Boolean,
     bypassLockscreen: Boolean,
     blockScreenshot: Boolean,
@@ -175,45 +183,36 @@ fun SettingsScreen(
         ) {
             Spacer(Modifier.height(8.dp))
 
-            // Status
-            Card(
-                Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = if (moduleActive) Color(0xFFE8F5E9) else Color(0xFFFFEBEE)
-                )
-            ) {
-                Row(Modifier.fillMaxWidth().padding(20.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Spacer(
-                        Modifier.size(12.dp).clip(CircleShape)
-                            .background(if (moduleActive) Color(0xFF4CAF50) else Color(0xFFE53935))
-                    )
-                    Spacer(Modifier.width(12.dp))
-                    Column {
-                        Text(
-                            if (moduleActive) "模块已激活" else "模块未激活",
-                            fontWeight = FontWeight.Medium, fontSize = 16.sp
-                        )
-                        Text(
-                            if (moduleActive) "Hook 已注入 system_server"
-                            else "请在 LSPosed 中启用并重启",
-                            fontSize = 13.sp, color = Color.Gray
-                        )
-                    }
+            // Status — 3 states: active / needs reboot / inactive
+            val statusBg: Color
+            val statusDot: Color
+            val statusTitle: String
+            val statusDesc: String
+            when {
+                moduleActive && !needsReboot -> {
+                    statusBg = Color(0xFFE8F5E9); statusDot = Color(0xFF4CAF50)
+                    statusTitle = "模块已激活"; statusDesc = "Hook 已注入 system_server"
+                }
+                moduleActive && needsReboot -> {
+                    statusBg = Color(0xFFFFF3E0); statusDot = Color(0xFFFF9800)
+                    statusTitle = "需要重启"; statusDesc = "检测到注入的 Hook 版本不一致，请重启设备"
+                }
+                else -> {
+                    statusBg = Color(0xFFFFEBEE); statusDot = Color(0xFFE53935)
+                    statusTitle = "模块未激活"; statusDesc = "请在 LSPosed 中启用，作用域选「系统框架」，然后重启"
                 }
             }
-
-            if (prefsFallback) {
-                Spacer(Modifier.height(8.dp))
-                Card(
-                    Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3E0))
-                ) {
-                    Text(
-                        "设置可能无法同步到模块（MODE_WORLD_READABLE 不可用）。" +
-                            "开关变更需重启后生效。",
-                        fontSize = 13.sp, color = Color(0xFFE65100),
-                        modifier = Modifier.padding(16.dp)
-                    )
+            Card(
+                Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = statusBg)
+            ) {
+                Row(Modifier.fillMaxWidth().padding(20.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Spacer(Modifier.size(12.dp).clip(CircleShape).background(statusDot))
+                    Spacer(Modifier.width(12.dp))
+                    Column {
+                        Text(statusTitle, fontWeight = FontWeight.Medium, fontSize = 16.sp)
+                        Text(statusDesc, fontSize = 13.sp, color = Color.Gray, lineHeight = 18.sp)
+                    }
                 }
             }
 

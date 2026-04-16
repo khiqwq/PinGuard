@@ -42,6 +42,7 @@ class MainHook : IXposedHookLoadPackage {
         const val FIELD_PG = "pg"
         const val FIELD_PG_RECEIVER = "pg_r"
         const val FIELD_PG_HANDLED = "pg_handled"
+        const val MODULE_VERSION = 3 // MUST match versionCode in build.gradle.kts
     }
 
     // ── state ───────────────────────────────────────────────────────
@@ -483,11 +484,18 @@ class MainHook : IXposedHookLoadPackage {
     private fun registerReceivers(ctx: Context) {
         val h = handler ?: return
 
-        // PING/PONG — respond with targeted PONG
+        // PING/PONG — respond with targeted PONG + prefs readability status
         ctx.registerReceiver(object : BroadcastReceiver() {
             override fun onReceive(c: Context, i: Intent) {
                 val sender = i.getStringExtra(EXTRA_PKG)
-                val pong = Intent(ACTION_PONG)
+                val prefsOk = try {
+                    val p = XSharedPreferences("io.github.khiqwq.pinguard", "config")
+                    p.reload()
+                    // If getAll() has entries, the file is readable
+                    // If empty but _sentinel was written, file is NOT readable
+                    p.all.isNotEmpty()
+                } catch (_: Exception) { false }
+                val pong = Intent(ACTION_PONG).putExtra("ver", MODULE_VERSION)
                 if (sender != null) pong.setPackage(sender)
                 c.sendBroadcast(pong)
             }
@@ -577,7 +585,16 @@ class MainHook : IXposedHookLoadPackage {
                     val receiver = object : BroadcastReceiver() {
                         override fun onReceive(ctx: Context, intent: Intent) {
                             pendingAuthToken = intent.getStringExtra(EXTRA_TOKEN)
-                            val act = currentActivity?.get() ?: return
+                            val act = currentActivity?.get()
+                            if (act == null) {
+                                // Activity GC'd (e.g. after screen off/on) — cancel to reset authPending
+                                ctx.sendBroadcast(
+                                    Intent(ACTION_AUTH_SUCCESS)
+                                        .setPackage("android")
+                                        .putExtra(EXTRA_TOKEN, "cancelled"))
+                                log("SHOW_AUTH: activity null, cancelled")
+                                return
+                            }
                             log("SHOW_AUTH → ${act.javaClass.name}")
                             showAuth(act)
                         }
