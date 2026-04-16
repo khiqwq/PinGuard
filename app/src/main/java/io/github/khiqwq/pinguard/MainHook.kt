@@ -79,6 +79,15 @@ class MainHook : IXposedHookLoadPackage {
     private fun isHideExitToast(): Boolean =
         loadPrefs()?.getBoolean("hide_exit_toast", false) ?: false
 
+    private fun isBypassLockscreen(): Boolean =
+        loadPrefs()?.getBoolean("bypass_lockscreen", true) ?: true
+
+    private fun isBlockScreenshot(): Boolean =
+        loadPrefs()?.getBoolean("block_screenshot", false) ?: false
+
+    private fun isAllowAssistant(): Boolean =
+        loadPrefs()?.getBoolean("allow_assistant", false) ?: false
+
     // ── entry ───────────────────────────────────────────────────────
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -196,6 +205,103 @@ class MainHook : IXposedHookLoadPackage {
                     }
                 })
         } catch (_: Exception) {}
+
+        // 4. Screenshot blocking during lock task
+        try {
+            val pwmClass = XposedHelpers.findClass(
+                "com.android.server.policy.PhoneWindowManager", lpparam.classLoader)
+
+            // Hook handleScreenShot — blocks key combo screenshots
+            for (method in pwmClass.declaredMethods) {
+                if (method.name == "handleScreenShot") {
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            if (isBlockScreenshot() && isInLockTaskWithProtectedApp()) {
+                                log("blocked screenshot")
+                                param.setResult(null)
+                            }
+                        }
+                    })
+                    logAlways("hooked handleScreenShot ✓")
+                }
+            }
+
+            // Also hook interceptScreenshotChord for earlier interception
+            for (method in pwmClass.declaredMethods) {
+                if (method.name == "interceptScreenshotChord") {
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            if (isBlockScreenshot() && isInLockTaskWithProtectedApp()) {
+                                log("blocked screenshot chord")
+                                param.setResult(null)
+                            }
+                        }
+                    })
+                }
+            }
+        } catch (e: Exception) {
+            log("screenshot hook fail: ${e.message}")
+        }
+
+        // 5. Allow voice assistant (小爱同学) during lock task
+        try {
+            val pwmClass = XposedHelpers.findClass(
+                "com.android.server.policy.PhoneWindowManager", lpparam.classLoader)
+
+            // Hook interceptKeyBeforeDispatching to allow assistant key through
+            for (method in pwmClass.declaredMethods) {
+                if (method.name == "interceptKeyBeforeDispatching") {
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            if (!isAllowAssistant() || !isInLockTaskWithProtectedApp()) return
+                            val event = param.args.firstOrNull { it is android.view.KeyEvent } as? android.view.KeyEvent ?: return
+                            // KEYCODE_ASSIST=219, KEYCODE_VOICE_ASSIST=231
+                            if (event.keyCode == 219 || event.keyCode == 231) {
+                                log("allowing assistant key through lock task")
+                                // Don't block — let it pass to the system
+                            }
+                        }
+                    })
+                }
+            }
+
+            // Hook LockTaskController to allow assistant intent
+            val ltcClass = XposedHelpers.findClass(
+                "com.android.server.wm.LockTaskController", lpparam.classLoader)
+            for (method in ltcClass.declaredMethods) {
+                if (method.name == "isPackageAllowlisted") {
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            if (!isAllowAssistant()) return
+                            val userId = try { param.args.last() as Int } catch (_: Exception) { return }
+                            val pkg = try { param.args.first() as String } catch (_: Exception) { return }
+                            // Allow Xiaomi voice assistant packages
+                            if (pkg.contains("voiceassist") || pkg.contains("mibrain") ||
+                                pkg.contains("aiasst") || pkg == "com.miui.voiceassist") {
+                                log("allowing assistant package: $pkg")
+                                param.setResult(true)
+                            }
+                        }
+                    })
+                    logAlways("hooked isPackageAllowlisted ✓")
+                }
+            }
+        } catch (e: Exception) {
+            log("assistant hook fail: ${e.message}")
+        }
+    }
+
+    // ── lock task state check ───────────────────────────────────────
+
+    private fun isInLockTaskWithProtectedApp(): Boolean {
+        val atms = atmsRef ?: return false
+        return try {
+            val ltc = XposedHelpers.getObjectField(atms, "mLockTaskController")
+            val state = XposedHelpers.getIntField(ltc, "mLockTaskModeState")
+            if (state == 0) return false
+            val pkg = getPinnedAppPackage(atms)
+            pkg != null && pkg in protectedPackages
+        } catch (_: Exception) { false }
     }
 
     // ── protected package tracking ──────────────────────────────────
@@ -394,6 +500,20 @@ class MainHook : IXposedHookLoadPackage {
                 } catch (_: Exception) {}
             }
             log("unpin OK")
+
+            // Dismiss keyguard if bypass_lockscreen is on
+            if (isBypassLockscreen()) {
+                try {
+                    val wms = Class.forName("android.view.WindowManagerGlobal")
+                        .getMethod("getWindowManagerService").invoke(null)
+                    wms.javaClass.getMethod(
+                        "dismissKeyguard",
+                        Class.forName("com.android.internal.policy.IKeyguardDismissCallback"),
+                        CharSequence::class.java
+                    ).invoke(wms, null, null)
+                    log("keyguard dismissed")
+                } catch (_: Exception) {}
+            }
         } catch (e: Exception) {
             logAlways("unpin FAIL: ${e.message}")
             authPassed.set(true)

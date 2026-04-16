@@ -84,11 +84,17 @@ class MainActivity : ComponentActivity() {
                     moduleActive = isActive,
                     prefsFallback = prefsFallback,
                     enabled = prefs.getBoolean("enabled", true),
-                    debugLog = prefs.getBoolean("debug_log", false),
+                    bypassLockscreen = prefs.getBoolean("bypass_lockscreen", true),
+                    blockScreenshot = prefs.getBoolean("block_screenshot", false),
+                    allowAssistant = prefs.getBoolean("allow_assistant", false),
                     hideExitToast = prefs.getBoolean("hide_exit_toast", false),
+                    debugLog = prefs.getBoolean("debug_log", false),
                     onEnabledChange = { prefs.edit().putBoolean("enabled", it).commit(); fixPerms() },
-                    onDebugLogChange = { prefs.edit().putBoolean("debug_log", it).commit(); fixPerms() },
-                    onHideExitToastChange = { prefs.edit().putBoolean("hide_exit_toast", it).commit(); fixPerms() }
+                    onBypassLockscreenChange = { prefs.edit().putBoolean("bypass_lockscreen", it).commit(); fixPerms() },
+                    onBlockScreenshotChange = { prefs.edit().putBoolean("block_screenshot", it).commit(); fixPerms() },
+                    onAllowAssistantChange = { prefs.edit().putBoolean("allow_assistant", it).commit(); fixPerms() },
+                    onHideExitToastChange = { prefs.edit().putBoolean("hide_exit_toast", it).commit(); fixPerms() },
+                    onDebugLogChange = { prefs.edit().putBoolean("debug_log", it).commit(); fixPerms() }
                 )
             }
         }
@@ -137,15 +143,24 @@ fun SettingsScreen(
     moduleActive: Boolean,
     prefsFallback: Boolean = false,
     enabled: Boolean,
-    debugLog: Boolean,
+    bypassLockscreen: Boolean,
+    blockScreenshot: Boolean,
+    allowAssistant: Boolean,
     hideExitToast: Boolean,
+    debugLog: Boolean,
     onEnabledChange: (Boolean) -> Unit,
-    onDebugLogChange: (Boolean) -> Unit,
-    onHideExitToastChange: (Boolean) -> Unit
+    onBypassLockscreenChange: (Boolean) -> Unit,
+    onBlockScreenshotChange: (Boolean) -> Unit,
+    onAllowAssistantChange: (Boolean) -> Unit,
+    onHideExitToastChange: (Boolean) -> Unit,
+    onDebugLogChange: (Boolean) -> Unit
 ) {
     var isEnabled by remember { mutableStateOf(enabled) }
-    var isDebugLog by remember { mutableStateOf(debugLog) }
+    var isBypassLockscreen by remember { mutableStateOf(bypassLockscreen) }
+    var isBlockScreenshot by remember { mutableStateOf(blockScreenshot) }
+    var isAllowAssistant by remember { mutableStateOf(allowAssistant) }
     var isHideExitToast by remember { mutableStateOf(hideExitToast) }
+    var isDebugLog by remember { mutableStateOf(debugLog) }
 
     Scaffold(
         topBar = { TopAppBar(title = { Text("PinGuard") }) },
@@ -206,6 +221,24 @@ fun SettingsScreen(
 
             ToggleCard("启用保护", "取消应用固定时要求指纹/密码", isEnabled) {
                 isEnabled = it; onEnabledChange(it)
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            ToggleCard("解锁不回锁屏", "验证后直接回桌面，跳过锁屏", isBypassLockscreen) {
+                isBypassLockscreen = it; onBypassLockscreenChange(it)
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            ToggleCard("禁用截图", "应用固定期间禁止截图", isBlockScreenshot) {
+                isBlockScreenshot = it; onBlockScreenshotChange(it)
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            ToggleCard("允许语音助手", "应用固定期间允许小爱同学唤醒（仅限小爱同学测试）", isAllowAssistant) {
+                isAllowAssistant = it; onAllowAssistantChange(it)
             }
 
             Spacer(Modifier.height(12.dp))
