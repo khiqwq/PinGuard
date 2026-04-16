@@ -223,7 +223,13 @@ fun SettingsScreen(
                 isEnabled = it; onEnabledChange(it)
             }
 
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "以下所有功能仅在作用域内的应用生效",
+                fontSize = 12.sp, color = Color(0xFF999999),
+                modifier = Modifier.padding(start = 8.dp)
+            )
+            Spacer(Modifier.height(10.dp))
 
             ToggleCard("解锁不回锁屏", "验证后直接回桌面，跳过锁屏", isBypassLockscreen) {
                 isBypassLockscreen = it; onBypassLockscreenChange(it)
@@ -231,13 +237,13 @@ fun SettingsScreen(
 
             Spacer(Modifier.height(12.dp))
 
-            ToggleCard("禁用截图", "应用固定期间禁止截图", isBlockScreenshot) {
+            ToggleCard("禁用截图", "应用固定期间禁止截图（优先级高于 HyperCeiler 允许截屏）", isBlockScreenshot) {
                 isBlockScreenshot = it; onBlockScreenshotChange(it)
             }
 
             Spacer(Modifier.height(12.dp))
 
-            ToggleCard("禁用语音助手", "应用固定期间禁止小爱同学唤醒（仅限小爱同学测试）", isAllowAssistant) {
+            ToggleCard("禁用小白条召唤语音助手", "应用固定期间禁止通过小白条唤醒小爱同学（仅限小爱同学测试）", isAllowAssistant) {
                 isAllowAssistant = it; onAllowAssistantChange(it)
             }
 
@@ -245,12 +251,6 @@ fun SettingsScreen(
 
             ToggleCard("隐藏退出提示", "屏蔽「如需取消固定此应用」提示", isHideExitToast) {
                 isHideExitToast = it; onHideExitToastChange(it)
-            }
-
-            Spacer(Modifier.height(12.dp))
-
-            ToggleCard("调试日志", "输出详细日志到 logcat", isDebugLog) {
-                isDebugLog = it; onDebugLogChange(it)
             }
 
             Spacer(Modifier.height(24.dp))
@@ -275,11 +275,21 @@ fun SettingsScreen(
 
             Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp),
                 colors = CardDefaults.cardColors(containerColor = Color.White)) {
-                Text(
-                    "adb logcat | grep PinGuard",
-                    fontSize = 13.sp, color = Color.Gray,
-                    modifier = Modifier.padding(20.dp)
-                )
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            "adb logcat | grep PinGuard",
+                            fontSize = 13.sp, color = Color(0xFF777777)
+                        )
+                    }
+                    Switch(checked = isDebugLog, onCheckedChange = {
+                        isDebugLog = it; onDebugLogChange(it)
+                    })
+                }
             }
 
             Spacer(Modifier.height(24.dp))

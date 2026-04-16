@@ -10,6 +10,7 @@ import android.content.IntentFilter
 import android.os.Binder
 import android.os.Handler
 import android.os.Looper
+import android.view.WindowManager
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -51,6 +52,7 @@ class MainHook : IXposedHookLoadPackage {
     private var debugLog = false
 
     @Volatile private var authToken: String? = null
+    private val suppressKeyguardUntil = AtomicLong(0)
 
     // ── logging ─────────────────────────────────────────────────────
 
@@ -80,7 +82,7 @@ class MainHook : IXposedHookLoadPackage {
         loadPrefs()?.getBoolean("hide_exit_toast", false) ?: false
 
     private fun isBypassLockscreen(): Boolean =
-        loadPrefs()?.getBoolean("bypass_lockscreen", true) ?: true
+        loadPrefs()?.getBoolean("bypass_lockscreen", true) ?: false
 
     private fun isBlockScreenshot(): Boolean =
         loadPrefs()?.getBoolean("block_screenshot", false) ?: false
@@ -192,7 +194,62 @@ class MainHook : IXposedHookLoadPackage {
             }
         }
 
-        // 3. Toast suppression (time-window + one-shot)
+        // 3. Prevent keyguard after unpin — TWO paths need blocking:
+        //
+        // Path A (actual on HyperOS):
+        //   performStopLockTask → setKeyguardState → reenableKeyguard
+        //     → enableKeyguard(true) → KeyguardViewMediator: "previously hidden, reshowing"
+        //   Fix: hook enableKeyguard, block true during suppress window
+        //
+        // Path B (AOSP fallback):
+        //   performStopLockTask → lockKeyguardIfNeeded → shouldLockKeyguard → lockNow
+        //   Fix: hook shouldLockKeyguard, return false
+
+        // Path A: enableKeyguard(true) — the REAL trigger on HyperOS
+        try {
+            val pwmClass = XposedHelpers.findClass(
+                "com.android.server.policy.PhoneWindowManager", lpparam.classLoader)
+            for (method in pwmClass.declaredMethods) {
+                if (method.name == "enableKeyguard") {
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            if (!isBypassLockscreen()) return
+                            if (System.currentTimeMillis() >= suppressKeyguardUntil.get()) return
+                            val enable = param.args.firstOrNull()
+                            if (enable is Boolean && enable) {
+                                param.setResult(null) // skip entirely
+                                logAlways("blocked enableKeyguard(true)")
+                            }
+                        }
+                    })
+                    logAlways("hooked PWM.enableKeyguard ✓")
+                }
+            }
+        } catch (e: Exception) {
+            logAlways("enableKeyguard hook fail: ${e.message}")
+        }
+
+        // Path B: shouldLockKeyguard — fallback for lockNow path
+        try {
+            val ltcClass = XposedHelpers.findClass(
+                "com.android.server.wm.LockTaskController", lpparam.classLoader)
+            XposedHelpers.findAndHookMethod(ltcClass, "shouldLockKeyguard",
+                Int::class.javaPrimitiveType,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (!isBypassLockscreen()) return
+                        if (System.currentTimeMillis() < suppressKeyguardUntil.get()) {
+                            param.setResult(false)
+                            logAlways("shouldLockKeyguard → false")
+                        }
+                    }
+                })
+            logAlways("hooked shouldLockKeyguard ✓")
+        } catch (e: Exception) {
+            log("shouldLockKeyguard hook fail: ${e.message}")
+        }
+
+        // 4. Toast suppression (time-window + one-shot)
         try {
             XposedHelpers.findAndHookMethod("android.widget.Toast", lpparam.classLoader,
                 "show", object : XC_MethodHook() {
@@ -206,63 +263,75 @@ class MainHook : IXposedHookLoadPackage {
                 })
         } catch (_: Exception) {}
 
-        // 4. Screenshot blocking during lock task
-        try {
-            val pwmClass = XposedHelpers.findClass(
-                "com.android.server.policy.PhoneWindowManager", lpparam.classLoader)
+        // 5. Screenshot blocking — multi-layer, HyperCeiler compatible
+        //
+        // Layer 1: Block screenshot initiation (system_server)
+        // Layer 2: Override HyperCeiler's FLAG_SECURE bypass (afterHook wins)
+        // Layer 3: Block HyperOS-specific capture path
 
-            // Hook handleScreenShot — blocks key combo screenshots
-            for (method in pwmClass.declaredMethods) {
-                if (method.name == "handleScreenShot") {
-                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (isBlockScreenshot() && isInLockTaskWithProtectedApp()) {
-                                log("blocked screenshot")
-                                param.setResult(null)
-                            }
-                        }
-                    })
-                    logAlways("hooked handleScreenShot ✓")
+        // Layer 1: Block screenshot methods in system_server
+        val screenshotCheck = object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                if (isBlockScreenshot() && isInLockTaskWithProtectedApp()) {
+                    log("blocked screenshot: ${param.method.name}")
+                    param.setResult(null)
                 }
             }
-
-            // Also hook interceptScreenshotChord for earlier interception
-            for (method in pwmClass.declaredMethods) {
-                if (method.name == "interceptScreenshotChord") {
-                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            if (isBlockScreenshot() && isInLockTaskWithProtectedApp()) {
-                                log("blocked screenshot chord")
-                                param.setResult(null)
-                            }
-                        }
-                    })
+        }
+        for (cls in listOf(
+            "com.android.server.policy.PhoneWindowManager" to listOf("handleScreenShot", "interceptScreenshotChord"),
+            "com.android.server.wm.DisplayPolicy" to listOf("takeScreenshot"),
+            "com.android.internal.util.ScreenshotHelper" to listOf("takeScreenshot")
+        )) {
+            try {
+                val clazz = XposedHelpers.findClass(cls.first, lpparam.classLoader)
+                for (method in clazz.declaredMethods) {
+                    if (method.name in cls.second) {
+                        XposedBridge.hookMethod(method, screenshotCheck)
+                    }
                 }
-            }
-        } catch (e: Exception) {
-            log("screenshot hook fail: ${e.message}")
+            } catch (_: Exception) {}
         }
 
-        // Also hook DisplayPolicy.takeScreenshot — catches ALL paths (3-finger swipe etc.)
+        // Layer 2: Override HyperCeiler — re-enforce isSecureLocked() = true
+        // HyperCeiler hooks isSecureLocked() to return false (allow screenshot)
+        // We use afterHook to override AFTER HyperCeiler's hook runs
         try {
-            val dpClass = XposedHelpers.findClass(
-                "com.android.server.wm.DisplayPolicy", lpparam.classLoader)
-            for (method in dpClass.declaredMethods) {
-                if (method.name == "takeScreenshot") {
+            val wsClass = XposedHelpers.findClass(
+                "com.android.server.wm.WindowState", lpparam.classLoader)
+            for (method in wsClass.declaredMethods) {
+                if (method.name == "isSecureLocked") {
                     XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
+                        override fun afterHookedMethod(param: MethodHookParam) {
                             if (isBlockScreenshot() && isInLockTaskWithProtectedApp()) {
-                                log("blocked DisplayPolicy.takeScreenshot")
-                                param.setResult(null)
+                                param.setResult(true)
                             }
                         }
                     })
-                    logAlways("hooked DisplayPolicy.takeScreenshot ✓")
+                    logAlways("hooked WindowState.isSecureLocked (after) ✓")
                 }
             }
-        } catch (e: Exception) {
-            log("DisplayPolicy screenshot hook fail: ${e.message}")
-        }
+        } catch (_: Exception) {}
+
+        // Layer 3: HyperOS-specific — notAllowCaptureDisplay
+        // HyperCeiler hooks this to return false; we override back to true
+        try {
+            val wmsImpl = XposedHelpers.findClass(
+                "com.android.server.wm.WindowManagerServiceImpl", lpparam.classLoader)
+            for (method in wmsImpl.declaredMethods) {
+                if (method.name == "notAllowCaptureDisplay") {
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            if (isBlockScreenshot() && isInLockTaskWithProtectedApp()) {
+                                param.setResult(true)
+                                log("notAllowCaptureDisplay → true")
+                            }
+                        }
+                    })
+                    logAlways("hooked notAllowCaptureDisplay (after) ✓")
+                }
+            }
+        } catch (_: Exception) {}
 
         // 5. Allow voice assistant (小爱同学) during lock task
         // Hook LockTaskController to allow assistant packages
@@ -442,7 +511,17 @@ class MainHook : IXposedHookLoadPackage {
                 authToken = null
                 authPending.set(false)
                 log("AUTH verified")
-                h.post { manualUnpin() }
+                if (isBypassLockscreen()) {
+                    h.post { manualUnpin() }
+                } else {
+                    // Normal flow — shows lock screen
+                    authPassed.set(true)
+                    h.post {
+                        try { XposedHelpers.callMethod(
+                            atmsRef, hookedMethodName ?: "stopSystemLockTaskMode") }
+                        catch (_: Exception) {}
+                    }
+                }
             }
         }, IntentFilter(ACTION_AUTH_SUCCESS), null, h, Context.RECEIVER_EXPORTED)
 
@@ -478,6 +557,9 @@ class MainHook : IXposedHookLoadPackage {
                     activity.sendBroadcast(
                         Intent(ACTION_REGISTER).putExtra(EXTRA_PKG, activity.packageName)
                     )
+
+                    // FLAG_SECURE for screenshot blocking during pin
+                    updateFlagSecure(activity)
 
                     if (XposedHelpers.getAdditionalInstanceField(activity, "pg") != null) return
                     XposedHelpers.setAdditionalInstanceField(activity, "pg", true)
@@ -541,6 +623,23 @@ class MainHook : IXposedHookLoadPackage {
             })
     }
 
+    private fun updateFlagSecure(activity: Activity) {
+        try {
+            val am = activity.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            val inLockTask = am.lockTaskModeState != android.app.ActivityManager.LOCK_TASK_MODE_NONE
+            val shouldBlock = isBlockScreenshot() && inLockTask
+            activity.runOnUiThread {
+                try {
+                    if (shouldBlock) {
+                        activity.window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                    } else {
+                        activity.window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                    }
+                } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
+    }
+
     // ═══════════════════════════════════════════════════════════════
     //  manual unpin (bypass keyguard)
     // ═══════════════════════════════════════════════════════════════
@@ -549,6 +648,11 @@ class MainHook : IXposedHookLoadPackage {
     private fun manualUnpin() {
         val callingId = Binder.clearCallingIdentity()
         try {
+            // Set suppress BEFORE clearing tasks (performStopLockTask is async)
+            if (isBypassLockscreen()) {
+                suppressKeyguardUntil.set(System.currentTimeMillis() + 5000)
+            }
+
             val globalLock = XposedHelpers.getObjectField(atmsRef, "mGlobalLock")
             synchronized(globalLock) {
                 val ltc = XposedHelpers.getObjectField(atmsRef, "mLockTaskController")
@@ -574,24 +678,6 @@ class MainHook : IXposedHookLoadPackage {
                 } catch (_: Exception) {}
             }
             log("unpin OK")
-
-            // Go to home screen directly, bypassing any lingering keyguard
-            if (isBypassLockscreen()) {
-                handler?.postDelayed({
-                    try {
-                        val ctx = XposedHelpers.getObjectField(atmsRef, "mContext") as Context
-                        val homeIntent = Intent(Intent.ACTION_MAIN).apply {
-                            addCategory(Intent.CATEGORY_HOME)
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or
-                                Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
-                        }
-                        val id = Binder.clearCallingIdentity()
-                        try { ctx.startActivity(homeIntent) }
-                        finally { Binder.restoreCallingIdentity(id) }
-                        log("started home")
-                    } catch (e: Exception) { log("home fail: ${e.message}") }
-                }, 200)
-            }
         } catch (e: Exception) {
             logAlways("unpin FAIL: ${e.message}")
             authPassed.set(true)
