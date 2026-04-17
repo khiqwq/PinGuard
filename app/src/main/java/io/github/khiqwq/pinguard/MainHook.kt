@@ -290,14 +290,24 @@ class MainHook : IXposedHookLoadPackage {
         logAlways("KVM hooks installed: $hookedCount")
     }
 
-    // Signal from system_server via Settings.Global: unpin in progress, skip reshow
+    // Suppress keyguard show/doKeyguardLocked in two cases:
+    //   (a) post-unpin 5-sec window (`SETTINGS_SUPPRESS_KEY` timestamp)
+    //   (b) pin mode is active AND bypass_lockscreen is enabled — this
+    //       prevents mNeedToReshowWhenReenabled from ever being set during
+    //       screen-off-while-pinned, which (when cleared on unpin) breaks
+    //       the downstream signal chain MIUI clipboard service listens to.
     private fun shouldSuppressReshow(kvm: Any): Boolean {
-        try {
+        return try {
             val ctx = XposedHelpers.getObjectField(kvm, "mContext") as Context
-            val until = Settings.Global.getLong(
-                ctx.contentResolver, SETTINGS_SUPPRESS_KEY, 0L)
-            return System.currentTimeMillis() < until
-        } catch (_: Exception) { return false }
+            val cr = ctx.contentResolver
+            val until = Settings.Global.getLong(cr, SETTINGS_SUPPRESS_KEY, 0L)
+            if (System.currentTimeMillis() < until) return true
+            // Case (b): in pin + bypass, keep keyguard fully dormant.
+            val bypass = Settings.Global.getInt(cr, "pg_bypass_lockscreen", 1) == 1
+            if (!bypass) return false
+            val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+            am != null && am.lockTaskModeState != android.app.ActivityManager.LOCK_TASK_MODE_NONE
+        } catch (_: Exception) { false }
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -964,6 +974,132 @@ class MainHook : IXposedHookLoadPackage {
             })
     }
 
+    // After our bypass-lockscreen unpin, IME/clipboard/brightness subsystems
+    // on HyperOS can stay stuck in pin-mode restrictions — they listen via
+    // ITaskStackListener.onLockTaskModeChanged, and the KVM-reshow suppression
+    // we do may skip the notification chain. Fire the callback manually.
+    //
+    // Must use direct reflection (not XposedHelpers.callMethod) so we can
+    // pass an `int` argument without auto-boxing to Integer — the real
+    // methods are declared with primitive int.
+    private fun invokeIntMethod(obj: Any, methodName: String, value: Int): Boolean {
+        var c: Class<*>? = obj.javaClass
+        while (c != null) {
+            try {
+                val m = c.getDeclaredMethod(methodName, Int::class.javaPrimitiveType)
+                m.isAccessible = true
+                m.invoke(obj, value)
+                return true
+            } catch (_: NoSuchMethodException) { c = c.superclass }
+        }
+        return false
+    }
+
+    private fun kickLockTaskStateChanged(atms: Any) {
+        // (1) WindowManager / RootWindowContainer / Policy path
+        var wmsKicked = false
+        for (fieldName in listOf("mWindowManager", "mRootWindowContainer")) {
+            try {
+                val obj = XposedHelpers.getObjectField(atms, fieldName) ?: continue
+                if (invokeIntMethod(obj, "onLockTaskStateChanged", 0)) {
+                    logAlways("kicked $fieldName.onLockTaskStateChanged(0)")
+                    wmsKicked = true
+                    break
+                }
+            } catch (_: Throwable) {}
+        }
+        if (!wmsKicked) {
+            try {
+                val rwc = XposedHelpers.getObjectField(atms, "mRootWindowContainer")
+                XposedHelpers.callMethod(rwc, "forAllDisplayPolicies",
+                    java.util.function.Consumer<Any> { dp ->
+                        invokeIntMethod(dp, "onLockTaskStateChangedLw", 0)
+                    })
+                log("kicked forAllDisplayPolicies.onLockTaskStateChangedLw(0)")
+            } catch (_: Throwable) {}
+        }
+
+        // (2) Find TaskChangeNotificationController and fire notifyLockTaskModeChanged(0).
+        //     TCNC can live on mTaskSupervisor, ATMS itself, or be returned
+        //     via a getter method.
+        val tcnc: Any? = run {
+            for ((parent, fieldName) in listOf(
+                atms to "mTaskChangeNotificationController",
+                atms to "mTaskSupervisor"
+            )) {
+                try {
+                    val v = XposedHelpers.getObjectField(parent, fieldName)
+                    if (v != null && v.javaClass.simpleName.contains("NotificationController")) {
+                        return@run v
+                    }
+                } catch (_: Throwable) {}
+            }
+            for (getter in listOf("getTaskChangeNotificationController")) {
+                try {
+                    val v = XposedHelpers.callMethod(atms, getter)
+                    if (v != null) return@run v
+                } catch (_: Throwable) {}
+            }
+            try {
+                val ts = XposedHelpers.getObjectField(atms, "mTaskSupervisor") ?: return@run null
+                for (fieldName in listOf(
+                    "mTaskChangeNotificationController", "mNotificationController"
+                )) {
+                    try {
+                        val v = XposedHelpers.getObjectField(ts, fieldName)
+                        if (v != null && v.javaClass.simpleName.contains("NotificationController")) {
+                            return@run v
+                        }
+                    } catch (_: Throwable) {}
+                }
+                try {
+                    val v = XposedHelpers.callMethod(ts, "getTaskChangeNotificationController")
+                    if (v != null) return@run v
+                } catch (_: Throwable) {}
+            } catch (_: Throwable) {}
+            null
+        }
+        if (tcnc != null) {
+            if (invokeIntMethod(tcnc, "notifyLockTaskModeChanged", 0)) {
+                logAlways("kicked TCNC(${tcnc.javaClass.simpleName}).notifyLockTaskModeChanged(0)")
+            } else {
+                logAlways("TCNC(${tcnc.javaClass.simpleName}) has no notifyLockTaskModeChanged(int)")
+            }
+        } else {
+            logAlways("TCNC not found")
+        }
+
+        // (3) Simulate a keyguard show→hide cycle for ScreenObserver listeners.
+        // MIUI clipboard restriction latches "pin mode active" on keyguard
+        // state changes; suppressing showKeyguard broke this signal chain.
+        // ATMS.onKeyguardStateChanged iterates mScreenObservers.
+        fun tryKeyguardStateChanged(showing: Boolean) {
+            try {
+                val m = atms.javaClass.getMethod("onKeyguardStateChanged",
+                    Boolean::class.javaPrimitiveType)
+                m.isAccessible = true
+                m.invoke(atms, showing)
+                logAlways("kicked ATMS.onKeyguardStateChanged($showing)")
+            } catch (_: NoSuchMethodException) {
+                // Fallback: try 2-arg variant (keyguardShowing, aodShowing)
+                try {
+                    val m = atms.javaClass.getMethod("onKeyguardStateChanged",
+                        Boolean::class.javaPrimitiveType, Boolean::class.javaPrimitiveType)
+                    m.isAccessible = true
+                    m.invoke(atms, showing, false)
+                    logAlways("kicked ATMS.onKeyguardStateChanged($showing, false)")
+                } catch (e: Throwable) {
+                    log("onKeyguardStateChanged not found: ${e.message}")
+                }
+            } catch (e: Throwable) {
+                log("onKeyguardStateChanged fail: ${e.message}")
+            }
+        }
+        // Fire the show→hide cycle MIUI clipboard/IME services expect on unpin.
+        tryKeyguardStateChanged(true)
+        tryKeyguardStateChanged(false)
+    }
+
     private fun updateFlagSecure(activity: Activity) {
         try {
             val am = activity.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
@@ -1015,6 +1151,16 @@ class MainHook : IXposedHookLoadPackage {
                 XposedHelpers.callMethod(
                     atms, hookedMethodName ?: "stopSystemLockTaskMode")
                 log("unpin OK via original")
+                // Our KVM-reshow suppression skips showKeyguard, which on
+                // HyperOS also short-circuits downstream notifications IME
+                // / clipboard / brightness listeners depend on. Re-fire the
+                // lock-task-mode-changed callback manually so those listeners
+                // see the NONE transition even when screen off/on happened
+                // during pin (which otherwise leaves IME clipboard stuck).
+                // performStopLockTask is async (mHandler.post), so the native
+                // state transition hasn't happened yet. Delay our kicks until
+                // after the handler has processed the stop.
+                handler?.postDelayed({ kickLockTaskStateChanged(atms) }, 250)
                 return
             } catch (e: Exception) {
                 logAlways("original unpin fail: ${e.message}, fallback to manual clear")

@@ -52,7 +52,7 @@ class MainActivity : ComponentActivity() {
 
     private val moduleActive = mutableStateOf(false)
     private val needsReboot = mutableStateOf(false)
-    private val systemUIHooked = mutableStateOf(false)
+    private val systemUIHooked = mutableStateOf(true) // optimistic; verified async by ping-pong
     private var pongReceiver: BroadcastReceiver? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
