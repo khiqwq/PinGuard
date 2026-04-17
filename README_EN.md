@@ -21,6 +21,8 @@
 - Intercepts screen unpin and requires system credential verification (fingerprint / PIN / pattern)
 - Goes directly to home screen after verification — **no lock screen**
 - Only protects apps in LSPosed scope; other apps unpin normally
+- Optional: block screenshots while app is pinned (overrides HyperCeiler's force-allow)
+- Optional: block voice assistant shortcuts while pinned (Xiao AI)
 - Optional: suppress the system "To unpin this app..." toast
 - Debug logging toggle
 

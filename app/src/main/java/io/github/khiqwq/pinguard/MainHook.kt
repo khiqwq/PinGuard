@@ -42,7 +42,7 @@ class MainHook : IXposedHookLoadPackage {
         const val FIELD_PG = "pg"
         const val FIELD_PG_RECEIVER = "pg_r"
         const val FIELD_PG_HANDLED = "pg_handled"
-        const val MODULE_VERSION = 6 // MUST match versionCode in build.gradle.kts
+        const val MODULE_VERSION = 7 // MUST match versionCode in build.gradle.kts
         const val SETTINGS_SUPPRESS_KEY = "pg_suppress_reshow_until"
         const val SETTINGS_SYSUI_READY_KEY = "pg_systemui_hooked"
         const val SETTINGS_PREFS_SAVED_KEY = "pg_prefs_saved"
@@ -346,7 +346,7 @@ class MainHook : IXposedHookLoadPackage {
                             } catch (_: Exception) {}
                             registerReceivers(ctx)
                             logAlways("ready")
-                        } catch (e: Exception) {
+                        } catch (e: Throwable) {
                             logAlways("onSystemReady FAIL: ${e.message}")
                         }
                     }
@@ -1162,9 +1162,14 @@ class MainHook : IXposedHookLoadPackage {
                 // after the handler has processed the stop.
                 handler?.postDelayed({ kickLockTaskStateChanged(atms) }, 250)
                 return
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 logAlways("original unpin fail: ${e.message}, fallback to manual clear")
-                authPassed.set(false) // not consumed; prevent leaking to next unpin
+                authPassed.set(false)
+                suppressKeyguardUntil.set(0)
+                try {
+                    val ctx = XposedHelpers.getObjectField(atms, "mContext") as Context
+                    Settings.Global.putLong(ctx.contentResolver, SETTINGS_SUPPRESS_KEY, 0L)
+                } catch (_: Throwable) {}
             }
 
             // Fallback: manual clear if original call fails. State notifications
